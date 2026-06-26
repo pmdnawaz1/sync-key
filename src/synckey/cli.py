@@ -1,19 +1,21 @@
 """synckey command-line interface.
 
-    synckey init                 one-time setup; prints your unified key
-    synckey providers            list every supported provider
-    synckey key add <provider>   store a provider credential
-    synckey key list             key health matrix with burn rate
+    synckey init                  one-time setup; prints your unified key
+    synckey providers             list every supported provider
+    synckey key add <provider>    store a credential (--key supports comma-separated bulk)
+    synckey key import <provider> bulk import from --file or --keys
+    synckey key list              key health matrix with burn rate
     synckey key rm|enable|disable
-    synckey key limits <id>      set RPM/TPM limits for a key
-    synckey models [--refresh]   discover models your keys can call
-    synckey detect <model>       show routing and tier
-    synckey serve                run the unified gateway
-    synckey usage [--recent]     token and cost monitoring
-    synckey spend                cost breakdown by model
-    synckey events [--type]      routing events log
-    synckey status               at-a-glance overview
-    synckey test [provider]      health-check stored keys
+    synckey key limits <id>       set RPM/TPM limits for a key
+    synckey models [--refresh]    discover models your keys can call
+    synckey detect <model>        show routing and tier
+    synckey serve                 run the unified gateway
+    synckey dash                  live dashboard (keys, events, burn rate)
+    synckey usage [--recent]      token and cost monitoring
+    synckey spend                 cost breakdown by model
+    synckey events [--type]       routing events log
+    synckey status                at-a-glance overview
+    synckey test [provider]       health-check stored keys
 """
 
 from __future__ import annotations
@@ -21,9 +23,12 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -128,17 +133,30 @@ def providers():
     ctx.close()
 
 
+def _add_one_key(ctx, provider: str, secret: str, label: str | None, weight: int, rpm, tpm) -> int:
+    existing = len(ctx.db.list_keys(provider=provider))
+    lbl = label or f"{provider}-{existing + 1}"
+    key_id = ctx.db.add_key(provider, lbl, ctx.box.seal(secret), weight=weight, rpm_limit=rpm, tpm_limit=tpm)
+    masked = secret[-4:] if len(secret) >= 4 else "***"
+    limits = (f" RPM={rpm}" if rpm else "") + (f" TPM={fmt_num(int(tpm))}" if tpm else "")
+    console.print(
+        f"[green]Added[/] {ctx.providers[provider].name} key [cyan]#{key_id}[/] "
+        f"(label={lbl}, weight={weight}{limits}). Masked: ...{masked}"
+    )
+    return key_id
+
+
 @key_app.command("add")
 def key_add(
     provider: str = typer.Argument(..., help="Provider id, e.g. groq, gemini, cohere."),
-    key: str = typer.Option(None, "--key", "-k", help="The secret."),
+    key: str = typer.Option(None, "--key", "-k", help="Secret key. Comma-separate for bulk."),
     label: str = typer.Option(None, "--label", "-l"),
     weight: int = typer.Option(1, "--weight", "-w"),
     from_env: bool = typer.Option(False, "--from-env"),
     rpm: float = typer.Option(None, "--rpm", help="Known RPM limit for this key."),
     tpm: float = typer.Option(None, "--tpm", help="Known TPM limit for this key."),
 ):
-    """Store a provider credential. Add several per provider for round-robin."""
+    """Store a credential. Comma-separate multiple keys for bulk add."""
     ctx = load_ctx()
     provider = provider.lower()
     if provider not in ctx.providers:
@@ -163,16 +181,59 @@ def key_add(
         err_con.print("[red]Empty key.[/]")
         raise typer.Exit(1)
 
-    existing = len(ctx.db.list_keys(provider=provider))
-    label = label or f"{provider}-{existing + 1}"
-    key_id = ctx.db.add_key(provider, label, ctx.box.seal(secret), weight=weight, rpm_limit=rpm, tpm_limit=tpm)
-    masked = secret[-4:] if len(secret) >= 4 else "***"
-    limits = f" RPM={rpm}" if rpm else ""
-    limits += f" TPM={fmt_num(int(tpm))}" if tpm else ""
-    console.print(
-        f"[green]Added[/] {prov.name} key [cyan]#{key_id}[/] (label={label}, weight={weight}{limits}). "
-        f"Masked: ...{masked}"
-    )
+    secrets = [s.strip() for s in secret.split(",") if s.strip()]
+    for i, s in enumerate(secrets):
+        lbl = label if len(secrets) == 1 else (f"{label}-{i+1}" if label else None)
+        _add_one_key(ctx, provider, s, lbl, weight, rpm, tpm)
+    ctx.close()
+
+
+@key_app.command("import")
+def key_import(
+    provider: str = typer.Argument(..., help="Provider id, e.g. groq, gemini."),
+    file: Path = typer.Option(None, "--file", "-f", help="File with one key per line."),
+    keys: str = typer.Option(None, "--keys", "-k", help="Comma-separated keys."),
+    from_env: bool = typer.Option(False, "--from-env", help="Import all matching env vars."),
+    weight: int = typer.Option(1, "--weight", "-w"),
+    rpm: float = typer.Option(None, "--rpm"),
+    tpm: float = typer.Option(None, "--tpm"),
+):
+    """Bulk-import keys: --file keys.txt, --keys k1,k2,k3, or --from-env."""
+    ctx = load_ctx()
+    provider = provider.lower()
+    if provider not in ctx.providers:
+        err_con.print(f"[red]Unknown provider '{provider}'.[/] Run `synckey providers`.")
+        raise typer.Exit(1)
+
+    prov = ctx.providers[provider]
+    secrets: list[str] = []
+
+    if file:
+        try:
+            lines = Path(file).read_text().splitlines()
+        except OSError as exc:
+            err_con.print(f"[red]Cannot read file:[/] {exc}")
+            raise typer.Exit(1)
+        secrets = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+    elif keys:
+        secrets = [k.strip() for k in keys.split(",") if k.strip()]
+    elif from_env:
+        for env in prov.env:
+            val = os.environ.get(env, "").strip()
+            if val:
+                secrets.append(val)
+                console.print(f"[dim]Read key from ${env}[/]")
+    else:
+        err_con.print("[red]Provide --file, --keys, or --from-env.[/]")
+        raise typer.Exit(1)
+
+    if not secrets:
+        err_con.print("[yellow]No keys found.[/]")
+        raise typer.Exit(1)
+
+    for s in secrets:
+        _add_one_key(ctx, provider, s, None, weight, rpm, tpm)
+    console.print(f"[green]Imported {len(secrets)} key(s) for {prov.name}.[/]")
     ctx.close()
 
 
@@ -599,6 +660,102 @@ def test(provider: str = typer.Argument(None)):
             table.add_row(pid, f"#{k.id} {k.label}", cur, result)
     console.print(table)
     ctx.close()
+
+
+@app.command()
+def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh interval (seconds).")):
+    """Live dashboard: key health, burn rates, and recent events. Press Ctrl+C to exit."""
+    from .state import Health as H, KeyState
+
+    ctx = load_ctx()
+
+    def _header() -> Panel:
+        totals = ctx.db.usage_totals()
+        all_st = ctx.states.all()
+        n_live = sum(1 for s in all_st.values() if s.health == H.LIVE)
+        n_cool = sum(1 for s in all_st.values() if s.health == H.COOLING)
+        n_dead = sum(1 for s in all_st.values() if s.health == H.DEAD)
+        return Panel(
+            f"[bold]{totals['requests'] or 0}[/] requests  "
+            f"[cyan]{fmt_num(totals['total_tokens'])}[/] tokens  "
+            f"[green]{fmt_cost(totals['cost_usd'])}[/] spent    "
+            f"keys: [green]{n_live} live[/]  [yellow]{n_cool} cooling[/]  [red]{n_dead} dead[/]",
+            title=f"[bold]synckey {__version__}[/]  (Ctrl+C to exit)",
+        )
+
+    def _keys_panel() -> Panel:
+        keys = ctx.db.list_keys()
+        stats = ctx.db.key_stats()
+        all_st = ctx.states.all()
+        t = Table(show_header=True, header_style="bold", expand=True, box=None)
+        for col in ("#", "provider", "health", "rpm", "reqs", "cost"):
+            t.add_column(col)
+        for k in keys:
+            st = all_st.get(k.id)
+            ks = st if st else KeyState()
+            remaining = ks.cooldown_remaining()
+            ht = health_text(ks.health, remaining)
+            bucket = ctx.pool._buckets._buckets.get(k.id)
+            rpm_used = f"{bucket.emission_rpm():.1f}" if bucket else "0.0"
+            s = stats.get(k.id, {})
+            t.add_row(str(k.id), k.provider, ht, rpm_used, str(s.get("requests", 0)), fmt_cost(s.get("cost")))
+        return Panel(t, title="Keys")
+
+    def _events_panel() -> Panel:
+        rows = ctx.db.recent_events(10)
+        t = Table(show_header=True, header_style="bold", expand=True, box=None)
+        for col in ("when", "type", "model", "note"):
+            t.add_column(col)
+        colors = {"rate_limited": "yellow", "key_dead": "red", "tier_fallback": "magenta"}
+        for r in rows:
+            ago = int(time.time() - r["ts"])
+            etype = r["type"] or ""
+            color = colors.get(etype, "")
+            t.add_row(
+                f"{ago}s",
+                f"[{color}]{etype}[/]" if color else etype,
+                r["model"] or "",
+                (r["message"] or "")[:40],
+            )
+        return Panel(t, title="Events")
+
+    def _requests_panel() -> Panel:
+        t = Table(show_header=True, header_style="bold", expand=True, box=None)
+        for col in ("when", "provider", "model", "status", "tokens", "ms"):
+            t.add_column(col)
+        for r in ctx.db.recent_usage(6):
+            ago = int(time.time() - r["ts"])
+            status = r["status_code"] or 0
+            color = "green" if status == 200 else "red"
+            t.add_row(
+                f"{ago}s", r["provider"], r["model"],
+                f"[{color}]{status}[/]", fmt_num(r["total_tokens"]), str(r["latency_ms"] or 0),
+            )
+        return Panel(t, title="Recent requests")
+
+    def _build() -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="body"),
+            Layout(name="footer", size=9),
+        )
+        layout["body"].split_row(Layout(name="keys", ratio=3), Layout(name="events", ratio=2))
+        layout["header"].update(_header())
+        layout["body"]["keys"].update(_keys_panel())
+        layout["body"]["events"].update(_events_panel())
+        layout["footer"].update(_requests_panel())
+        return layout
+
+    try:
+        with Live(_build(), refresh_per_second=1, screen=True) as live:
+            while True:
+                time.sleep(interval)
+                live.update(_build())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ctx.close()
 
 
 @app.command()

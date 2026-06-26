@@ -59,6 +59,41 @@ def plan_attempts(ctx: Context, resolution: Resolution, max_retries: int) -> lis
     return attempts[: max_retries + 1]
 
 
+def all_deep_cooling(attempts: list[Attempt], threshold: float) -> bool:
+    """True when every candidate is cooling and won't free up for a while."""
+    return bool(attempts) and all(
+        a.candidate.cooling and a.candidate.cooldown_remaining >= threshold
+        for a in attempts
+    )
+
+
+def build_tier_alt_attempts(ctx: Context, resolution: Resolution, body: dict) -> list[Attempt]:
+    """Find ready candidates on same-tier alternative models."""
+    if not (resolution.tier and resolution.floor):
+        return []
+    alts = ctx.router.tier_alternatives(resolution.tier, resolution.floor, resolution.bare_model)
+    for alt_model, alt_pid in alts:
+        prov = ctx.providers.get(alt_pid)
+        if not prov:
+            continue
+        # Only take candidates that are not themselves cooling.
+        cands = [c for c in ctx.pool.candidates(alt_pid) if not c.cooling]
+        if not cands:
+            continue
+        ctx.db.record_event(
+            type="tier_fallback",
+            provider=alt_pid,
+            model=resolution.bare_model,
+            fallback_to=alt_model,
+            tier_from=resolution.tier,
+            tier_to=resolution.tier,
+            message=f"Primary blocked; routing to {alt_model} on {alt_pid}",
+        )
+        body["model"] = alt_model
+        return [Attempt(alt_pid, prov, c.key_id, c.secret, c) for c in cands]
+    return []
+
+
 def authorized(ctx: Context, request: Request) -> bool:
     expected = ctx.unified_key_hash()
     if not expected:
@@ -230,29 +265,14 @@ async def forward(
 
     attempts = plan_attempts(ctx, resolution, ctx.settings.max_retries)
 
-    # Tier fallback: if primary providers are all exhausted, find same-tier alts.
-    if not attempts and ctx.settings.tier_fallback_enabled and resolution.tier and resolution.floor:
-        alts = ctx.router.tier_alternatives(resolution.tier, resolution.floor, resolution.bare_model)
-        for alt_model, alt_pid in alts:
-            prov = ctx.providers.get(alt_pid)
-            if not prov:
-                continue
-            for cand in ctx.pool.candidates(alt_pid):
-                if attempts:
-                    break
-                attempts.append(Attempt(alt_pid, prov, cand.key_id, cand.secret, cand))
-                ctx.db.record_event(
-                    type="tier_fallback",
-                    provider=alt_pid,
-                    model=resolution.bare_model,
-                    fallback_to=alt_model,
-                    tier_from=resolution.tier,
-                    tier_to=resolution.tier,
-                    message=f"Primary model exhausted; routing to same-tier alt {alt_model}",
-                )
-            if attempts:
-                body["model"] = alt_model
-                break
+    # Jump to same-tier alternatives when primary is gone or all keys deep-cooling.
+    if ctx.settings.tier_fallback_enabled:
+        threshold = ctx.settings.deep_cooling_threshold
+        if not attempts or all_deep_cooling(attempts, threshold):
+            alt_attempts = build_tier_alt_attempts(ctx, resolution, body)
+            if alt_attempts:
+                attempts = alt_attempts
+            # If no tier alts found, fall through to the cooling primaries (beats 503).
 
     if not attempts:
         return err(

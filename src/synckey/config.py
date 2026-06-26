@@ -51,6 +51,8 @@ class Settings:
     default_cooldown: float = 20.0
     # Tier fallback: allow cross-tier fallback to same-tier alternatives.
     tier_fallback_enabled: bool = True
+    # Seconds of cooldown remaining before we skip to tier alternatives entirely.
+    deep_cooling_threshold: float = 60.0
     # User-defined model -> tier overrides, e.g. {"my-model": "frontier"}.
     tier_overrides: dict[str, str] = field(default_factory=dict)
     # User-defined model pricing overrides, e.g. {"my-model": [1.0, 3.0]}.
@@ -77,6 +79,7 @@ class Settings:
             max_retries=routing.get("max_retries", cls.max_retries),
             default_cooldown=routing.get("default_cooldown", cls.default_cooldown),
             tier_fallback_enabled=routing.get("tier_fallback", True),
+            deep_cooling_threshold=routing.get("deep_cooling_threshold", cls.deep_cooling_threshold),
             tier_overrides=tiers.get("overrides", {}),
             price_overrides=tiers.get("prices", {}),
             custom_providers=data.get("providers", []),
