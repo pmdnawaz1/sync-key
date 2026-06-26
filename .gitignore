@@ -21,11 +21,10 @@ htmlcov/
 *.synckey
 secret.key
 config.local.toml
-
-# Local test artifacts that contain real keys — never commit
 key.txt
-test_all.py
+keys.txt
 *.keys
+test_all.py
 
 # Editors / OS
 .idea/
