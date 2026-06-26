@@ -58,6 +58,13 @@ class Settings:
     # User-defined model pricing overrides, e.g. {"my-model": [1.0, 3.0]}.
     price_overrides: dict[str, list] = field(default_factory=dict)
     custom_providers: list[dict] = field(default_factory=list)
+    # Deferred queue: when all keys are cooling, accept the request, return a
+    # request id, run it when capacity frees, and serve the result on a later GET.
+    deferred_enabled: bool = True
+    deferred_ttl: float = 3600.0          # keep a finished response this long, then purge
+    deferred_poll: float = 5.0            # worker scan interval (seconds)
+    deferred_max_queue: int = 1000        # reject new deferrals beyond this many queued
+    deferred_max_queue_age: float = 86400.0  # drop a job that never ran within this window
 
     @classmethod
     def load(cls) -> "Settings":
@@ -68,6 +75,7 @@ class Settings:
         gw = data.get("gateway", {})
         routing = data.get("routing", {})
         tiers = data.get("tiers", {})
+        deferred = data.get("deferred", {})
         return cls(
             host=gw.get("host", cls.host),
             port=gw.get("port", cls.port),
@@ -83,6 +91,11 @@ class Settings:
             tier_overrides=tiers.get("overrides", {}),
             price_overrides=tiers.get("prices", {}),
             custom_providers=data.get("providers", []),
+            deferred_enabled=deferred.get("enabled", True),
+            deferred_ttl=deferred.get("ttl", cls.deferred_ttl),
+            deferred_poll=deferred.get("poll", cls.deferred_poll),
+            deferred_max_queue=deferred.get("max_queue", cls.deferred_max_queue),
+            deferred_max_queue_age=deferred.get("max_queue_age", cls.deferred_max_queue_age),
         )
 
 

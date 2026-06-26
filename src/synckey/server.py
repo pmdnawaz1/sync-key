@@ -17,6 +17,7 @@ models if needed).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -30,10 +31,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .context import Context
 from .db import sha256
-from .keypool import KeyPool, parse_retry_after, Candidate
+from .deferred import estimate_eta, new_request_id
+from .keypool import parse_retry_after, Candidate
 from .providers import Provider
 from .router import Resolution
-from .tiers import TIER_BY_NAME, cost_usd, model_tier
+from .tiers import TIER_BY_NAME, cost_usd
 from .usage import UsageWriter
 
 
@@ -127,9 +129,19 @@ async def lifespan(app: FastAPI):
     )
     app.state.writer = UsageWriter(ctx.db.path)
     app.state.writer.start()
+    app.state.worker_task = None
+    if s.deferred_enabled:
+        ctx.db.reset_running_deferred()  # recover jobs interrupted by a crash
+        app.state.worker_task = asyncio.create_task(deferred_worker(app))
     try:
         yield
     finally:
+        if app.state.worker_task is not None:
+            app.state.worker_task.cancel()
+            try:
+                await app.state.worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await app.state.client.aclose()
         app.state.writer.stop()
         if app.state.owns_ctx:
@@ -210,6 +222,47 @@ def create_app(ctx: Context | None = None) -> FastAPI:
             ]
         }
 
+    @app.get("/v1/requests/{request_id}")
+    async def get_deferred(request: Request, request_id: str):
+        if not authorized(ctx, request):
+            return unauthorized()
+        row = ctx.db.get_deferred(request_id)
+        if row is None:
+            return err(
+                "Unknown or expired request id. Deferred results are purged after their TTL.",
+                "not_found_error",
+                404,
+            )
+        status = row["status"]
+        if status == "done":
+            return Response(
+                content=row["response"] or b"",
+                media_type="application/json",
+                status_code=row["status_code"] or 200,
+            )
+        if status == "error":
+            return err(
+                row["error"] or "Deferred request failed.",
+                "deferred_error",
+                row["status_code"] or 502,
+                request_id=request_id,
+            )
+        # queued or running: tell the caller when to check back.
+        eta = row["eta"] or 0
+        remaining = int(eta - time.time()) if eta else int(ctx.settings.default_cooldown)
+        retry_after = max(1, remaining) + 1
+        return JSONResponse(
+            {
+                "id": request_id,
+                "object": "deferred",
+                "status": status,
+                "retry_after": retry_after,
+                "result_url": f"/v1/requests/{request_id}",
+            },
+            status_code=202,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         return await forward(ctx, request, "/chat/completions")
@@ -236,32 +289,72 @@ async def forward(
     except Exception:
         return err("Body must be valid JSON.", "invalid_request_error", 400)
 
+    # synckey-specific routing hints; strip from the body before forwarding upstream.
+    provider_hint = body.pop("provider", None) or request.headers.get("x-provider")
     model = body.get("model")
-    if not model:
-        return err("Field 'model' is required.", "invalid_request_error", 400)
 
     # Parse optional quality floor from caller.
     floor_header = request.headers.get("x-quality-floor")
     floor = TIER_BY_NAME.get(floor_header.lower()) if floor_header else None
 
-    resolution = ctx.router.resolve(str(model), floor=floor)
+    resolution = ctx.router.resolve_full(
+        str(model) if model else None, provider_hint, floor
+    )
+    if resolution is None:
+        return err(
+            "No 'model' given and no default is configured. Send a model, name a "
+            "provider, or set one with `synckey config set-default <model>`.",
+            "invalid_request_error",
+            400,
+        )
     if not resolution.providers:
         return err(
-            f"Could not route '{model}'. No provider advertises it. "
-            "Use a 'provider/model' prefix or run `synckey models --refresh`.",
+            f"Could not route '{model or resolution.bare_model}'. No provider advertises it. "
+            "Use a 'provider/model' prefix, name a provider, or run `synckey models --refresh`.",
             "not_found_error",
             404,
         )
 
+    client: httpx.AsyncClient = request.app.state.client
+    writer: UsageWriter = request.app.state.writer
+
+    result = await run_request(
+        ctx, client, writer, path, body, resolution, allow_stream,
+        defer_when_no_capacity=ctx.settings.deferred_enabled,
+    )
+    if result is not None:
+        return result
+
+    # No key has spare capacity and deferral is on: queue it, hand back a poll id.
+    return defer_request(ctx, path, body, model, provider_hint, floor, resolution)
+
+
+async def run_request(
+    ctx: Context,
+    client: httpx.AsyncClient,
+    writer: UsageWriter,
+    path: str,
+    body: dict,
+    resolution: Resolution,
+    allow_stream: bool,
+    defer_when_no_capacity: bool = True,
+) -> Response | None:
+    """Run a resolved request through the key pool.
+
+    Returns a Response on success, upstream error, or exhaustion. Returns None
+    only when no key has spare capacity right now — i.e. every usable key is
+    either provider-cooling (429'd) or locally bucket-throttled — and
+    `defer_when_no_capacity` is set. That None is the caller's signal to queue
+    the request for later. When there are no usable keys at all (none configured
+    or all dead), a 503 Response is returned instead, since deferring could never
+    resolve.
+    """
     body["model"] = resolution.bare_model
     stream = bool(body.get("stream")) and allow_stream
     if stream:
         opts = body.get("stream_options") or {}
         opts["include_usage"] = True
         body["stream_options"] = opts
-
-    client: httpx.AsyncClient = request.app.state.client
-    writer: UsageWriter = request.app.state.writer
 
     attempts = plan_attempts(ctx, resolution, ctx.settings.max_retries)
 
@@ -276,11 +369,14 @@ async def forward(
 
     if not attempts:
         return err(
-            f"'{model}' has no available keys. All keys may be cooling, dead, or exhausted. "
+            "No available keys for this route: none configured, or all are dead. "
             "Run `synckey key list` to check.",
             "no_available_keys",
             503,
         )
+    if defer_when_no_capacity and not any(a.candidate.ready for a in attempts):
+        # No key is ready: all are cooling (429'd) and/or locally bucket-throttled.
+        return None  # caller defers rather than firing into a likely 429
 
     last_err = "unknown"
     last_status = 502
@@ -333,11 +429,102 @@ async def forward(
             return Response(content=resp.content, media_type="application/json", status_code=resp.status_code)
 
     return err(
-        f"All {len(attempts)} attempts failed for '{model}'. Last: {last_err}",
+        f"All {len(attempts)} attempts failed for '{resolution.bare_model}'. Last: {last_err}",
         "upstream_exhausted",
         last_status if last_status >= 400 else 502,
         providers_tried=resolution.providers,
     )
+
+
+def defer_request(
+    ctx: Context,
+    path: str,
+    body: dict,
+    model: str | None,
+    provider_hint: str | None,
+    floor: int | None,
+    resolution: Resolution,
+) -> JSONResponse:
+    """Persist a request whose keys are all cooling and return a 202 + poll info."""
+    if ctx.db.count_deferred("queued") >= ctx.settings.deferred_max_queue:
+        return err(
+            "Deferred queue is full; try again shortly.", "queue_full", 503
+        )
+
+    body.pop("stream", None)
+    body.pop("stream_options", None)
+    rid = new_request_id()
+    eta_seconds = estimate_eta(ctx, resolution.providers)
+    ctx.db.create_deferred(
+        id=rid,
+        path=path,
+        body=json.dumps(body),
+        model=str(model) if model else resolution.bare_model,
+        provider_hint=provider_hint,
+        floor=floor,
+        eta=time.time() + eta_seconds,
+    )
+    retry_after = int(eta_seconds) + 1
+    ctx.db.record_event(
+        type="deferred",
+        model=resolution.bare_model,
+        message=f"All keys cooling; queued {rid}, ETA ~{retry_after}s",
+    )
+    return JSONResponse(
+        {
+            "id": rid,
+            "object": "deferred",
+            "status": "queued",
+            "model": resolution.bare_model,
+            "retry_after": retry_after,
+            "result_url": f"/v1/requests/{rid}",
+            "message": (
+                "All provider keys are rate-limited. Your request is queued; poll "
+                "result_url with your unified key after retry_after seconds."
+            ),
+        },
+        status_code=202,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+async def deferred_worker(app: FastAPI) -> None:
+    """Background loop: replay queued requests once a key frees, store the result."""
+    ctx: Context = app.state.ctx
+    s = ctx.settings
+    client: httpx.AsyncClient = app.state.client
+    writer: UsageWriter = app.state.writer
+    while True:
+        try:
+            await asyncio.sleep(s.deferred_poll)
+            ctx.db.purge_deferred(s.deferred_ttl, s.deferred_max_queue_age)
+            for row in ctx.db.queued_deferred(limit=20):
+                await _run_deferred_job(ctx, client, writer, row)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            continue
+
+
+async def _run_deferred_job(ctx: Context, client, writer, row) -> None:
+    rid = row["id"]
+    try:
+        body = json.loads(row["body"])
+    except ValueError:
+        ctx.db.fail_deferred(rid, 400, "Stored body was not valid JSON.")
+        return
+    resolution = ctx.router.resolve_full(row["model"], row["provider_hint"], row["floor"])
+    if resolution is None or not resolution.providers:
+        ctx.db.fail_deferred(rid, 404, "Request is no longer routable.")
+        return
+
+    ctx.db.set_deferred_running(rid)
+    resp = await run_request(ctx, client, writer, row["path"], body, resolution, allow_stream=False)
+    if resp is None:
+        # Still no capacity; put it back with a fresh ETA for the next cycle.
+        ctx.db.requeue_deferred(rid, time.time() + estimate_eta(ctx, resolution.providers))
+        return
+    ctx.db.complete_deferred(rid, resp.status_code, bytes(resp.body))
 
 
 def extract_usage(content: bytes) -> tuple[int, int, int]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -56,10 +57,28 @@ CREATE TABLE IF NOT EXISTS events (
     message     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS deferred (
+    id            TEXT    PRIMARY KEY,
+    created_at    REAL    NOT NULL,
+    status        TEXT    NOT NULL,        -- queued | running | done | error
+    path          TEXT    NOT NULL,        -- e.g. /chat/completions
+    body          TEXT    NOT NULL,        -- JSON request body (non-stream)
+    model         TEXT,                    -- original model string (may be null)
+    provider_hint TEXT,
+    floor         INTEGER,
+    eta           REAL,                    -- approx unix time the call can run
+    response      BLOB,                    -- stored upstream bytes when done
+    status_code   INTEGER,
+    error         TEXT,
+    completed_at  REAL,
+    attempts      INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_keys_provider ON keys(provider);
+CREATE INDEX IF NOT EXISTS idx_deferred_status ON deferred(status);
 """
 
 USAGE_COLS = (
@@ -119,6 +138,18 @@ class Database:
     def get_meta(self, name: str) -> str | None:
         row = self.conn.execute("SELECT value FROM meta WHERE name=?", (name,)).fetchone()
         return row["value"] if row else None
+
+    def get_json(self, name: str, default=None):
+        raw = self.get_meta(name)
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return default
+
+    def set_json(self, name: str, obj) -> None:
+        self.set_meta(name, json.dumps(obj))
 
     # keys
     def add_key(
@@ -266,3 +297,93 @@ class Database:
         return self.conn.execute(
             "SELECT * FROM usage ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    # deferred queue
+    def create_deferred(
+        self,
+        *,
+        id: str,
+        path: str,
+        body: str,
+        model: str | None,
+        provider_hint: str | None,
+        floor: int | None,
+        eta: float | None,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO deferred(id, created_at, status, path, body, model, "
+            "provider_hint, floor, eta) VALUES(?,?,?,?,?,?,?,?,?)",
+            (id, time.time(), "queued", path, body, model, provider_hint, floor, eta),
+        )
+        self.conn.commit()
+
+    def get_deferred(self, id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM deferred WHERE id=?", (id,)).fetchone()
+
+    def queued_deferred(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM deferred WHERE status='queued' ORDER BY created_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def count_deferred(self, status: str | None = None) -> int:
+        if status:
+            row = self.conn.execute(
+                "SELECT COUNT(*) c FROM deferred WHERE status=?", (status,)
+            ).fetchone()
+        else:
+            row = self.conn.execute("SELECT COUNT(*) c FROM deferred").fetchone()
+        return row["c"]
+
+    def recent_deferred(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM deferred ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def set_deferred_running(self, id: str) -> None:
+        self.conn.execute(
+            "UPDATE deferred SET status='running', attempts=attempts+1 WHERE id=?", (id,)
+        )
+        self.conn.commit()
+
+    def requeue_deferred(self, id: str, eta: float | None) -> None:
+        self.conn.execute(
+            "UPDATE deferred SET status='queued', eta=? WHERE id=?", (eta, id)
+        )
+        self.conn.commit()
+
+    def complete_deferred(self, id: str, status_code: int, response: bytes) -> None:
+        self.conn.execute(
+            "UPDATE deferred SET status='done', status_code=?, response=?, completed_at=? "
+            "WHERE id=?",
+            (status_code, response, time.time(), id),
+        )
+        self.conn.commit()
+
+    def fail_deferred(self, id: str, status_code: int, error: str) -> None:
+        self.conn.execute(
+            "UPDATE deferred SET status='error', status_code=?, error=?, completed_at=? "
+            "WHERE id=?",
+            (status_code, error[:500], time.time(), id),
+        )
+        self.conn.commit()
+
+    def reset_running_deferred(self) -> int:
+        """On startup, return any 'running' jobs (from a crash) to the queue."""
+        cur = self.conn.execute(
+            "UPDATE deferred SET status='queued' WHERE status='running'"
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def purge_deferred(self, ttl: float, max_queue_age: float) -> int:
+        """Delete finished jobs older than `ttl` and queued jobs stuck past `max_queue_age`."""
+        now = time.time()
+        cur = self.conn.execute(
+            "DELETE FROM deferred WHERE "
+            "(status IN ('done','error') AND completed_at IS NOT NULL AND completed_at < ?) "
+            "OR (status='queued' AND created_at < ?)",
+            (now - ttl, now - max_queue_age),
+        )
+        self.conn.commit()
+        return cur.rowcount

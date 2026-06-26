@@ -20,8 +20,9 @@ import httpx
 
 from .config import Settings
 from .db import Database
+from .prefs import Prefs
 from .providers import Provider, match_by_pattern, split_provider_prefix
-from .tiers import TIER_NAMES, model_tier
+from .tiers import TIER_BY_NAME, model_tier
 
 
 class Resolution:
@@ -66,15 +67,36 @@ def parse_model_ids(payload: dict) -> list[str]:
 
 
 class Router:
-    def __init__(self, db: Database, providers: dict[str, Provider], settings: Settings):
+    def __init__(
+        self,
+        db: Database,
+        providers: dict[str, Provider],
+        settings: Settings,
+        prefs: Prefs | None = None,
+    ):
         self.db = db
         self.providers = providers
         self.settings = settings
+        self.prefs = prefs or Prefs(db)
         self._known_ids = set(providers)
         self._index: dict[str, set[str]] = {}
         self._tier_index: dict[int, list[str]] = {}  # tier -> [model_ids in index]
         self._index_built_at: float = 0.0
+        # User defaults/aliases are read once at startup (hot-path: no per-request
+        # DB read). CLI changes apply on the next `serve`; call reload_prefs() to
+        # pick them up in-process (tests, the dashboard).
+        self._aliases: dict[str, str] = {}
+        self._global_default: str | None = None
+        self._provider_defaults: dict[str, str] = {}
+        self.reload_prefs()
         self._load_cached_index()
+
+    def reload_prefs(self) -> None:
+        self._aliases = {k.lower(): v for k, v in self.prefs.aliases().items()}
+        self._global_default = self.prefs.global_default() or None
+        self._provider_defaults = {
+            k.lower(): v for k, v in self.prefs.provider_defaults().items()
+        }
 
     def _load_cached_index(self) -> None:
         raw = self.db.get_meta("model_index")
@@ -145,23 +167,109 @@ class Router:
         return parse_model_ids(resp.json())
 
     def resolve(self, model: str, floor: int | None = None) -> Resolution:
-        pid, bare = split_provider_prefix(model, self._known_ids)
-        tier = model_tier(bare if pid else model)
+        tier = model_tier(model)
         effective_floor = floor if floor is not None else tier
 
-        if pid:
-            return Resolution(bare, [pid], "prefix", tier=tier, floor=effective_floor)
-
+        # Index-first: if the full model string is in the live index, use it.
+        # This prevents org-namespaced names like "openai/gpt-oss-120b" from
+        # being mis-routed by prefix splitting (e.g. to OpenAI when it lives
+        # on Groq).
         providers = self._index.get(model)
         if providers:
             ordered = order_by_priority(sorted(providers), self.settings.provider_priority)
             return Resolution(model, ordered, "index", tier=tier, floor=effective_floor)
 
+        # Explicit prefix (groq/llama-3.3-70b-versatile).
+        pid, bare = split_provider_prefix(model, self._known_ids)
+        if pid:
+            tier = model_tier(bare)
+            effective_floor = floor if floor is not None else tier
+            return Resolution(bare, [pid], "prefix", tier=tier, floor=effective_floor)
+
+        # Static name patterns.
         guess = match_by_pattern(model, self.providers)
         if guess:
             return Resolution(model, [guess], "pattern", tier=tier, floor=effective_floor)
 
         return Resolution(model, [], "unknown", tier=tier, floor=effective_floor)
+
+    def _models_at_tier(self, tier: int) -> list[str]:
+        """Models in the live index at `tier`, ordered by their best provider's priority."""
+        prio = self.settings.provider_priority
+
+        def best_rank(model: str) -> int:
+            provs = self._index.get(model, set())
+            if not provs:
+                return len(prio) + 1
+            return min(prio.index(p) if p in prio else len(prio) for p in provs)
+
+        return sorted(self._tier_index.get(tier, []), key=best_rank)
+
+    def materialize(self, value: str) -> str | None:
+        """Expand an alias or tier name into a concrete model id.
+
+        - `value` may be an alias ("fast"), a tier ("mid" or "tier:mid"), or a
+          plain model id. Alias chains are followed (with a cycle guard).
+        - A tier resolves to the best live model at that tier, or None if the
+          index has none.
+        - A plain model id passes through unchanged.
+        """
+        v = value
+        seen: set[str] = set()
+        while v and v.lower() in self._aliases and v.lower() not in seen:
+            seen.add(v.lower())
+            v = self._aliases[v.lower()]
+        name = v[5:] if v.lower().startswith("tier:") else v
+        t = TIER_BY_NAME.get(name.lower()) if name else None
+        if t is not None:
+            models = self._models_at_tier(t)
+            return models[0] if models else None
+        return v
+
+    def resolve_full(
+        self, model: str | None, provider_hint: str | None, floor: int | None
+    ) -> Resolution | None:
+        """Request-time resolution with defaults, aliases, and a provider hint.
+
+        Precedence is 'model wins, provider is a hint':
+          - An explicit model routes normally; a provider hint only reorders the
+            candidate providers (or, if the model is otherwise unroutable, picks
+            the hinted provider).
+          - A missing/`default`/`auto` model falls back to the provider's default
+            (when a provider is named) or the global default.
+
+        Returns None only when no model can be determined at all (no model given
+        and no default configured). An undetermined-but-named model comes back as
+        a Resolution with empty providers (the caller turns that into a 404).
+        """
+        hint = provider_hint.lower() if provider_hint else None
+        chosen = model
+        if not chosen or chosen.lower() in ("default", "auto"):
+            chosen = (self._provider_defaults.get(hint) if hint else None) or self._global_default
+            if not chosen:
+                return None
+
+        concrete = self.materialize(chosen) or chosen
+        res = self.resolve(concrete, floor=floor)
+
+        if hint:
+            if hint in res.providers:
+                res.providers = [hint] + [p for p in res.providers if p != hint]
+            elif not res.providers and hint in self._known_ids:
+                # Model didn't resolve on its own; honor the hint as the target.
+                res = Resolution(concrete, [hint], "provider-hint", tier=res.tier, floor=res.floor)
+        return res
+
+    def merge_provider_models(self, provider: str, models: list[str]) -> None:
+        """Replace one provider's slice of the live index with `models`, then persist."""
+        for m in list(self._index):
+            self._index[m].discard(provider)
+        for m in models:
+            self._index.setdefault(m, set()).add(provider)
+        self._index = {m: ps for m, ps in self._index.items() if ps}
+        self._index_built_at = time.time()
+        self._rebuild_tier_index()
+        self._save_cached_index()
 
     def tier_alternatives(self, tier: int, floor: int, exclude_model: str) -> list[tuple[str, str]]:
         """Find (model, provider) pairs in the index at the given tier (and >= floor).

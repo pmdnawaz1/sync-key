@@ -106,12 +106,15 @@ class Bucket:
         # Drain the bucket so we don't immediately send more.
         self._req_tokens = 0.0
 
-    def headroom(self) -> float:
-        """Fraction of capacity still available (1.0 = full, 0.0 = empty)."""
+    def seconds_to_capacity(self) -> float:
+        """Estimate seconds until at least one request token refills (0 if ready now)."""
         self._refill()
-        if self.rpm_cap is None:
-            return 1.0
-        return self._req_tokens / self.rpm_cap if self.rpm_cap > 0 else 0.0
+        if self.rpm_cap is None or self._req_tokens >= 1.0:
+            return 0.0
+        rate = self.rpm_cap / 60.0  # tokens per second
+        if rate <= 0:
+            return 0.0
+        return (1.0 - self._req_tokens) / rate
 
 
 class BucketRegistry:

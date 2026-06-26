@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 
-from .bucket import BucketRegistry
 from .config import Settings, db_path, secret_key_path
 from .crypto import SecretBox
 from .db import Database
 from .keypool import KeyPool
+from .prefs import Prefs
 from .providers import BUILTIN, Provider
 from .router import Router
 from .state import StateStore
@@ -39,10 +39,14 @@ def merged_providers(settings: Settings) -> dict[str, Provider]:
 class Context:
     def __init__(self) -> None:
         self.settings = Settings.load()
-        load_overrides(self.settings.tier_overrides, self.settings.price_overrides)
         self.providers = merged_providers(self.settings)
         self.box = SecretBox(secret_key_path())
         self.db = Database(db_path())
+        self.prefs = Prefs(self.db)
+        # Tier overrides come from two places: config.toml (static, versioned) and
+        # the DB (set via `synckey tier set`). DB wins on conflict.
+        merged_tiers = {**self.settings.tier_overrides, **self.prefs.tier_overrides()}
+        load_overrides(merged_tiers, self.settings.price_overrides)
         self.states = StateStore(self.db.path)
         self.pool = KeyPool(
             self.db,
@@ -50,7 +54,7 @@ class Context:
             self.states,
             default_cooldown=self.settings.default_cooldown,
         )
-        self.router = Router(self.db, self.providers, self.settings)
+        self.router = Router(self.db, self.providers, self.settings, self.prefs)
 
     def first_secret(self, provider_id: str) -> str | None:
         keys = self.db.list_keys(provider=provider_id, enabled_only=True)

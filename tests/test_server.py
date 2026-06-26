@@ -145,6 +145,45 @@ def test_quality_floor_header_parsed(ctx):
     assert r.status_code in (200, 404, 502, 503)
 
 
+@respx.mock
+def test_provider_field_stripped_from_upstream_body(ctx):
+    import json as _json
+
+    _add(ctx, n=1)
+    route = respx.post(GROQ_CHAT).mock(
+        return_value=httpx.Response(200, json={"choices": [], "usage": {}})
+    )
+    with TestClient(create_app(ctx)) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            headers=AUTH,
+            json={"model": "groq/llama-3.3-70b-versatile", "provider": "groq", "messages": []},
+        )
+    assert r.status_code == 200
+    sent = _json.loads(route.calls.last.request.content)
+    assert "provider" not in sent  # synckey-only hint must not leak upstream
+
+
+@respx.mock
+def test_default_model_used_when_model_omitted(ctx):
+    _add(ctx, n=1)
+    ctx.prefs.set_global_default("llama-3.3-70b-versatile")  # matches groq pattern
+    ctx.router.reload_prefs()
+    route = respx.post(GROQ_CHAT).mock(
+        return_value=httpx.Response(200, json={"choices": [], "usage": {}})
+    )
+    with TestClient(create_app(ctx)) as client:
+        r = client.post("/v1/chat/completions", headers=AUTH, json={"messages": []})
+    assert r.status_code == 200
+    assert route.call_count == 1
+
+
+def test_no_model_no_default_returns_400(ctx):
+    with TestClient(create_app(ctx)) as client:
+        r = client.post("/v1/chat/completions", headers=AUTH, json={"messages": []})
+    assert r.status_code == 400
+
+
 def test_healthz_includes_key_counts(ctx):
     _add(ctx, n=2)
     ctx.pool.on_rate_limit(1, retry_after=60)

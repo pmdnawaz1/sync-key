@@ -62,7 +62,7 @@ BUILTIN: dict[str, Provider] = {
             name="Groq",
             base_url="https://api.groq.com/openai/v1",
             env=("GROQ_API_KEY",),
-            patterns=(r"versatile$", r"instant$", r"^whisper-large", r"^groq/"),
+            patterns=(r"versatile$", r"instant$", r"^whisper-large", r"^groq/", r"^gpt-oss", r"^openai/gpt-oss"),
             signup="https://console.groq.com/keys",
         ),
         Provider(
