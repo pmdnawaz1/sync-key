@@ -1,9 +1,4 @@
-"""SQLite persistence: credentials, usage records, metadata.
-
-Reads happen on the request path (the key roster) and stay cheap under WAL.
-Usage writes never touch this connection on the hot path; they go through the
-batched background writer in usage.py, which owns its own connection.
-"""
+"""SQLite persistence: credentials, usage records, events, metadata."""
 
 from __future__ import annotations
 
@@ -21,39 +16,57 @@ CREATE TABLE IF NOT EXISTS meta (
 
 CREATE TABLE IF NOT EXISTS keys (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    provider   TEXT NOT NULL,
-    label      TEXT NOT NULL,
-    secret     BLOB NOT NULL,
+    provider   TEXT    NOT NULL,
+    label      TEXT    NOT NULL,
+    secret     BLOB    NOT NULL,
     enabled    INTEGER NOT NULL DEFAULT 1,
     weight     INTEGER NOT NULL DEFAULT 1,
-    created_at REAL NOT NULL
+    rpm_limit  REAL,
+    tpm_limit  REAL,
+    created_at REAL    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS usage (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts                REAL NOT NULL,
-    provider          TEXT NOT NULL,
-    model             TEXT NOT NULL,
+    ts                REAL    NOT NULL,
+    provider          TEXT    NOT NULL,
+    model             TEXT    NOT NULL,
     key_id            INTEGER,
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens      INTEGER NOT NULL DEFAULT 0,
+    cost_usd          REAL,
     status_code       INTEGER NOT NULL DEFAULT 0,
     latency_ms        INTEGER NOT NULL DEFAULT 0,
     stream            INTEGER NOT NULL DEFAULT 0,
+    tier              INTEGER,
     error             TEXT
 );
 
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    type        TEXT    NOT NULL,
+    key_id      INTEGER,
+    provider    TEXT,
+    model       TEXT,
+    fallback_to TEXT,
+    tier_from   INTEGER,
+    tier_to     INTEGER,
+    message     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
-CREATE INDEX IF NOT EXISTS idx_usage_key ON usage(key_id);
+CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_keys_provider ON keys(provider);
 """
 
-USAGE_COLUMNS = (
+USAGE_COLS = (
     "ts, provider, model, key_id, prompt_tokens, completion_tokens, "
-    "total_tokens, status_code, latency_ms, stream, error"
+    "total_tokens, cost_usd, status_code, latency_ms, stream, tier, error"
 )
-USAGE_INSERT = f"INSERT INTO usage({USAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+USAGE_INSERT = f"INSERT INTO usage({USAGE_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
 
 
 def tune(conn: sqlite3.Connection) -> None:
@@ -61,6 +74,7 @@ def tune(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-8000")
 
 
 @dataclass
@@ -71,6 +85,8 @@ class KeyRecord:
     secret: bytes
     enabled: bool
     weight: int
+    rpm_limit: float | None
+    tpm_limit: float | None
     created_at: float
 
 
@@ -94,7 +110,7 @@ class Database:
     # meta
     def set_meta(self, name: str, value: str) -> None:
         self.conn.execute(
-            "INSERT INTO meta(name, value) VALUES(?, ?) "
+            "INSERT INTO meta(name, value) VALUES(?,?) "
             "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
             (name, value),
         )
@@ -105,10 +121,19 @@ class Database:
         return row["value"] if row else None
 
     # keys
-    def add_key(self, provider: str, label: str, secret: bytes, weight: int = 1) -> int:
+    def add_key(
+        self,
+        provider: str,
+        label: str,
+        secret: bytes,
+        weight: int = 1,
+        rpm_limit: float | None = None,
+        tpm_limit: float | None = None,
+    ) -> int:
         cur = self.conn.execute(
-            "INSERT INTO keys(provider, label, secret, weight, created_at) VALUES(?,?,?,?,?)",
-            (provider, label, secret, weight, time.time()),
+            "INSERT INTO keys(provider, label, secret, weight, rpm_limit, tpm_limit, created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (provider, label, secret, weight, rpm_limit, tpm_limit, time.time()),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -120,6 +145,12 @@ class Database:
 
     def set_key_enabled(self, key_id: int, enabled: bool) -> None:
         self.conn.execute("UPDATE keys SET enabled=? WHERE id=?", (1 if enabled else 0, key_id))
+        self.conn.commit()
+
+    def set_key_limits(self, key_id: int, rpm: float | None, tpm: float | None) -> None:
+        self.conn.execute(
+            "UPDATE keys SET rpm_limit=?, tpm_limit=? WHERE id=?", (rpm, tpm, key_id)
+        )
         self.conn.commit()
 
     def list_keys(self, provider: str | None = None, enabled_only: bool = False) -> list[KeyRecord]:
@@ -141,6 +172,8 @@ class Database:
                 secret=r["secret"],
                 enabled=bool(r["enabled"]),
                 weight=r["weight"],
+                rpm_limit=r["rpm_limit"],
+                tpm_limit=r["tpm_limit"],
                 created_at=r["created_at"],
             )
             for r in self.conn.execute(sql, params).fetchall()
@@ -152,23 +185,61 @@ class Database:
         ).fetchall()
         return [r["provider"] for r in rows]
 
-    def key_request_counts(self) -> dict[int, tuple[int, int]]:
-        """Map key_id -> (requests, errors), derived from the usage log."""
+    def key_stats(self) -> dict[int, dict]:
+        """Per-key request/error/token/cost totals from usage log."""
         rows = self.conn.execute(
-            "SELECT key_id, COUNT(*) AS reqs, "
-            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) AS errs "
+            "SELECT key_id, COUNT(*) reqs, "
+            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) errs, "
+            "SUM(total_tokens) tokens, SUM(cost_usd) cost "
             "FROM usage WHERE key_id IS NOT NULL GROUP BY key_id"
         ).fetchall()
-        return {r["key_id"]: (r["reqs"], r["errs"] or 0) for r in rows}
+        return {
+            r["key_id"]: {
+                "requests": r["reqs"],
+                "errors": r["errs"] or 0,
+                "tokens": r["tokens"] or 0,
+                "cost": r["cost"] or 0.0,
+            }
+            for r in rows
+        }
+
+    # events
+    def record_event(
+        self,
+        *,
+        type: str,
+        key_id: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        fallback_to: str | None = None,
+        tier_from: int | None = None,
+        tier_to: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO events(ts,type,key_id,provider,model,fallback_to,tier_from,tier_to,message) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (time.time(), type, key_id, provider, model, fallback_to, tier_from, tier_to, message),
+        )
+        self.conn.commit()
+
+    def recent_events(self, limit: int = 50, event_type: str | None = None) -> list[sqlite3.Row]:
+        if event_type:
+            return self.conn.execute(
+                "SELECT * FROM events WHERE type=? ORDER BY ts DESC LIMIT ?", (event_type, limit)
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
 
     # usage reads
     def usage_summary(self, since: float | None = None) -> list[sqlite3.Row]:
         sql = (
-            "SELECT provider, model, COUNT(*) AS requests, "
-            "SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, "
-            "SUM(total_tokens) AS total_tokens, "
-            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) AS errors, "
-            "AVG(latency_ms) AS avg_latency FROM usage"
+            "SELECT provider, model, tier, COUNT(*) requests, "
+            "SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens, "
+            "SUM(total_tokens) total_tokens, SUM(cost_usd) cost_usd, "
+            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) errors, "
+            "AVG(latency_ms) avg_latency FROM usage"
         )
         params: list = []
         if since is not None:
@@ -179,9 +250,10 @@ class Database:
 
     def usage_totals(self, since: float | None = None) -> sqlite3.Row:
         sql = (
-            "SELECT COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, "
-            "SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, "
-            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) AS errors "
+            "SELECT COUNT(*) requests, SUM(total_tokens) total_tokens, "
+            "SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens, "
+            "SUM(cost_usd) cost_usd, "
+            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) errors "
             "FROM usage"
         )
         params: list = []

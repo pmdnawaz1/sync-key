@@ -1,9 +1,7 @@
-"""Batched, off-thread usage writer.
+"""Batched off-thread usage writer.
 
-The gateway calls record() once per request. It is non-blocking: the row goes
-on a queue and a single background thread (its own SQLite connection) flushes
-in batches. Commits are amortized over many requests instead of one fsync per
-request, which is what lets the gateway sustain high request rates on one core.
+The gateway calls record() once per request. Non-blocking: the row queues and
+a background thread flushes in batches. One fsync per batch instead of per request.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ from pathlib import Path
 
 from .db import USAGE_INSERT, tune
 
-# A row matches the order in db.USAGE_INSERT.
 Row = tuple
 
 
@@ -42,9 +39,11 @@ class UsageWriter:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        cost_usd: float | None = None,
         status_code: int = 0,
         latency_ms: int = 0,
         stream: bool = False,
+        tier: int | None = None,
         error: str | None = None,
     ) -> None:
         row = (
@@ -55,16 +54,17 @@ class UsageWriter:
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cost_usd,
             status_code,
             latency_ms,
             1 if stream else 0,
+            tier,
             error,
         )
         try:
             self.queue.put_nowait(row)
         except queue.Full:
-            # Under extreme backpressure, drop metrics rather than stall serving.
-            pass
+            pass  # drop metrics under extreme backpressure
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -72,7 +72,7 @@ class UsageWriter:
             self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
-        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn = sqlite3.connect(str(self.path), check_same_thread=False)
         tune(conn)
         try:
             while True:

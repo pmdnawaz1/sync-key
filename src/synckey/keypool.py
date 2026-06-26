@@ -1,18 +1,23 @@
-"""Key pool: round-robin selection with rate-limit eating.
+"""Key pool: proactive + tier-aware selection.
 
-Runtime state (cooldowns, failure counts, rotation cursor) lives in memory, and
-decrypted secrets are cached, so picking a key never hits the database or runs a
-Fernet decrypt on the hot path. The key roster is read from SQLite per call,
-which is a cheap WAL read and keeps the pool in sync when the CLI changes keys.
+Selection order for a provider:
+  1. LIVE keys whose bucket has capacity  (best: no 429 risk)
+  2. LIVE keys whose bucket is exhausted  (might 429 but key itself is healthy)
+  3. COOLING keys, soonest-free first     (last resort)
+  DEAD keys are never returned.
+
+This means the gateway stops sending to a key *before* it 429s, not after.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+from .bucket import Bucket, BucketRegistry
 from .crypto import SecretBox
 from .db import Database, KeyRecord
+from .state import Health, StateStore
 
 
 @dataclass
@@ -20,41 +25,46 @@ class Candidate:
     key_id: int
     label: str
     secret: str
+    provider: str
+    ready: bool          # True if bucket has capacity right now
     cooling: bool
     cooldown_remaining: float
+    bucket: Bucket
 
 
-@dataclass
-class KeyState:
-    cooldown_until: float = 0.0
-    consecutive_failures: int = 0
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 class KeyPool:
-    def __init__(self, db: Database, box: SecretBox, default_cooldown: float = 20.0):
+    def __init__(
+        self,
+        db: Database,
+        box: SecretBox,
+        states: StateStore,
+        default_cooldown: float = 20.0,
+    ):
         self.db = db
         self.box = box
+        self.states = states
         self.default_cooldown = default_cooldown
-        self._state: dict[int, KeyState] = {}
         self._secrets: dict[int, str] = {}
+        self._buckets = BucketRegistry()
         self._cursor: dict[str, int] = {}
 
-    def _secret_for(self, rec: KeyRecord) -> str:
-        cached = self._secrets.get(rec.id)
-        if cached is None:
-            cached = self.box.open(rec.secret)
-            self._secrets[rec.id] = cached
-        return cached
+    def _secret(self, rec: KeyRecord) -> str:
+        s = self._secrets.get(rec.id)
+        if s is None:
+            s = self.box.open(rec.secret)
+            self._secrets[rec.id] = s
+        return s
 
-    def _state_for(self, key_id: int) -> KeyState:
-        st = self._state.get(key_id)
-        if st is None:
-            st = KeyState()
-            self._state[key_id] = st
-        return st
-
-    def candidates(self, provider: str) -> list[Candidate]:
-        """Live keys first (round-robin), then cooling keys soonest-free first."""
+    def candidates(self, provider: str, estimated_tokens: int = 0) -> list[Candidate]:
         records = self.db.list_keys(provider=provider, enabled_only=True)
         if not records:
             return []
@@ -68,46 +78,62 @@ class KeyPool:
         rotated = weighted[start:] + weighted[:start]
 
         now = time.time()
-        available: list[Candidate] = []
+        ready: list[Candidate] = []
+        throttled: list[Candidate] = []
         cooling: list[Candidate] = []
         seen: set[int] = set()
+
         for r in rotated:
             if r.id in seen:
                 continue
             seen.add(r.id)
-            remaining = max(0.0, self._state_for(r.id).cooldown_until - now)
+
+            st = self.states.get(r.id)
+            if st.health == Health.DEAD:
+                continue
+
+            bucket = self._buckets.get(r.id, rpm_cap=r.rpm_limit, tpm_cap=r.tpm_limit)
+            remaining = max(0.0, st.cooldown_until - now) if st.health == Health.COOLING else 0.0
+            is_cooling = remaining > 0
+            can_send = bucket.can_send(estimated_tokens)
+
             cand = Candidate(
                 key_id=r.id,
                 label=r.label,
-                secret=self._secret_for(r),
-                cooling=remaining > 0,
+                secret=self._secret(r),
+                provider=provider,
+                ready=can_send and not is_cooling,
+                cooling=is_cooling,
                 cooldown_remaining=remaining,
+                bucket=bucket,
             )
-            (cooling if cand.cooling else available).append(cand)
+            if is_cooling:
+                cooling.append(cand)
+            elif can_send:
+                ready.append(cand)
+            else:
+                throttled.append(cand)
 
         cooling.sort(key=lambda c: c.cooldown_remaining)
-        return available + cooling
+        return ready + throttled + cooling
 
-    def report_success(self, key_id: int) -> None:
-        self._state_for(key_id).consecutive_failures = 0
+    def on_success(self, key_id: int) -> None:
+        self.states.set_live(key_id)
+        self._buckets.get(key_id).on_success()
 
-    def report_rate_limit(self, key_id: int, retry_after: float | None = None) -> None:
-        st = self._state_for(key_id)
+    def on_rate_limit(self, key_id: int, retry_after: float | None, rpm_at_429: float | None = None) -> None:
         cooldown = retry_after if retry_after and retry_after > 0 else self.default_cooldown
-        st.cooldown_until = time.time() + cooldown
-        st.consecutive_failures += 1
+        self.states.set_cooling(key_id, time.time() + cooldown, rpm_observed=rpm_at_429)
+        self._buckets.get(key_id).on_rate_limit(retry_after, rpm_at_429)
 
-    def report_failure(self, key_id: int, backoff: float | None = None) -> None:
-        st = self._state_for(key_id)
-        st.consecutive_failures += 1
-        delay = backoff if backoff is not None else min(self.default_cooldown, 2.0 * st.consecutive_failures)
-        st.cooldown_until = time.time() + delay
+    def on_dead(self, key_id: int, reason: str) -> None:
+        self.states.set_dead(key_id, reason)
 
+    def on_failure(self, key_id: int) -> None:
+        st = self.states.get(key_id)
+        fails = (1 if st.health == Health.LIVE else 2)
+        delay = min(self.default_cooldown, 2.0 * fails)
+        self.states.set_cooling(key_id, time.time() + delay)
 
-def parse_retry_after(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
+    def consume(self, key_id: int, estimated_tokens: int = 0) -> None:
+        self._buckets.get(key_id).consume(estimated_tokens)

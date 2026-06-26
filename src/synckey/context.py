@@ -1,19 +1,21 @@
-"""Shared runtime wiring used by both the CLI and the gateway server."""
+"""Shared runtime wiring."""
 
 from __future__ import annotations
 
 import os
 
+from .bucket import BucketRegistry
 from .config import Settings, db_path, secret_key_path
 from .crypto import SecretBox
 from .db import Database
 from .keypool import KeyPool
 from .providers import BUILTIN, Provider
 from .router import Router
+from .state import StateStore
+from .tiers import load_overrides
 
 
 def merged_providers(settings: Settings) -> dict[str, Provider]:
-    """Built-in registry overlaid with user-defined providers from config."""
     providers = dict(BUILTIN)
     for spec in settings.custom_providers:
         try:
@@ -37,14 +39,20 @@ def merged_providers(settings: Settings) -> dict[str, Provider]:
 class Context:
     def __init__(self) -> None:
         self.settings = Settings.load()
+        load_overrides(self.settings.tier_overrides, self.settings.price_overrides)
         self.providers = merged_providers(self.settings)
         self.box = SecretBox(secret_key_path())
         self.db = Database(db_path())
-        self.pool = KeyPool(self.db, self.box, default_cooldown=self.settings.default_cooldown)
+        self.states = StateStore(self.db.path)
+        self.pool = KeyPool(
+            self.db,
+            self.box,
+            self.states,
+            default_cooldown=self.settings.default_cooldown,
+        )
         self.router = Router(self.db, self.providers, self.settings)
 
     def first_secret(self, provider_id: str) -> str | None:
-        """A usable secret for discovery, falling back to environment variables."""
         keys = self.db.list_keys(provider=provider_id, enabled_only=True)
         if keys:
             return self.box.open(keys[0].secret)
@@ -59,4 +67,5 @@ class Context:
         return self.db.get_meta("unified_key_hash")
 
     def close(self) -> None:
+        self.states.close()
         self.db.close()

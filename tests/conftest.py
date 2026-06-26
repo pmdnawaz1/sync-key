@@ -6,7 +6,6 @@ import pytest
 
 @pytest.fixture()
 def synckey_home(monkeypatch):
-    """Isolate each test in its own SYNCKEY_HOME."""
     d = tempfile.mkdtemp(prefix="synckey-test-")
     monkeypatch.setenv("SYNCKEY_HOME", d)
     monkeypatch.delenv("SYNCKEY_DB", raising=False)
