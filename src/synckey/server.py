@@ -1,16 +1,18 @@
-"""The unified gateway: one OpenAI-compatible endpoint, every provider behind it.
+"""The unified gateway: one OpenAI-compatible endpoint over every provider.
 
-Exposes:
-    POST /v1/chat/completions   (streaming + non-streaming)
+Endpoints:
+    POST /v1/chat/completions   (streaming and non-streaming)
     POST /v1/embeddings
-    GET  /v1/models             (aggregated across configured providers)
-    GET  /v1/usage              (synckey extension: live token totals)
+    POST /v1/completions
+    GET  /v1/models             aggregated across configured providers
+    GET  /v1/usage              live token totals
     GET  /healthz
 
-Auth: clients send the unified key as ``Authorization: Bearer sk-synckey-...``.
-Internally the request is routed to a provider, a live key is drawn from the
-pool, and on 429/5xx the request fails over to the next key/provider — the
-"rate-limit eater" — so callers just keep getting answers.
+Clients send the unified key as a bearer token. Each request is routed to a
+provider, draws a live key from the pool, and on 429 or 5xx fails over to the
+next key, then the next provider that serves the model. The hot path does no
+blocking database work: key state is in memory and usage rows are handed to a
+background writer.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .context import Context
@@ -30,6 +32,7 @@ from .db import sha256
 from .keypool import parse_retry_after
 from .providers import Provider
 from .router import Resolution
+from .usage import UsageWriter
 
 
 @dataclass
@@ -37,37 +40,33 @@ class Attempt:
     provider_id: str
     provider: Provider
     key_id: int
-    label: str
     secret: str
     cooling: bool
 
 
-def _build_plan(ctx: Context, resolution: Resolution, max_retries: int) -> list[Attempt]:
-    """Flatten resolved providers + their pooled keys into an ordered try-list."""
-    plan: list[Attempt] = []
+def plan_attempts(ctx: Context, resolution: Resolution, max_retries: int) -> list[Attempt]:
+    """Flatten resolved providers and their pooled keys into an ordered try-list."""
+    attempts: list[Attempt] = []
     for pid in resolution.providers:
         prov = ctx.providers.get(pid)
         if not prov:
             continue
         for cand in ctx.pool.candidates(pid):
-            plan.append(
-                Attempt(pid, prov, cand.key_id, cand.label, cand.secret, cand.cooling)
-            )
-    # Live keys first across all providers, throttled keys last; stable within.
-    plan.sort(key=lambda a: a.cooling)
-    return plan[: max_retries + 1] if max_retries else plan
+            attempts.append(Attempt(pid, prov, cand.key_id, cand.secret, cand.cooling))
+    attempts.sort(key=lambda a: a.cooling)  # live keys first, throttled last
+    return attempts[: max_retries + 1] if max_retries else attempts
 
 
-def _auth_ok(ctx: Context, request: Request) -> bool:
+def authorized(ctx: Context, request: Request) -> bool:
     expected = ctx.unified_key_hash()
     if not expected:
         return False
     header = request.headers.get("authorization", "")
-    token = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
+    token = header[7:].strip() if header[:7].lower() == "bearer " else header.strip()
     return bool(token) and sha256(token) == expected
 
 
-def _unauth() -> JSONResponse:
+def unauthorized() -> JSONResponse:
     return JSONResponse(
         {"error": {"message": "Invalid unified key.", "type": "authentication_error"}},
         status_code=401,
@@ -77,13 +76,21 @@ def _unauth() -> JSONResponse:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ctx: Context = app.state.ctx
-    app.state.client = httpx.AsyncClient(timeout=ctx.settings.request_timeout)
+    settings = ctx.settings
+    app.state.client = httpx.AsyncClient(
+        timeout=settings.request_timeout,
+        limits=httpx.Limits(
+            max_connections=settings.max_connections,
+            max_keepalive_connections=settings.max_keepalive,
+        ),
+    )
+    app.state.writer = UsageWriter(ctx.db.path)
+    app.state.writer.start()
     try:
         yield
     finally:
         await app.state.client.aclose()
-        # Only tear down a context this app created; a caller-supplied ctx
-        # (CLI, tests) owns its own lifecycle.
+        app.state.writer.stop()
         if app.state.owns_ctx:
             ctx.close()
 
@@ -105,20 +112,19 @@ def create_app(ctx: Context | None = None) -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
-        if not _auth_ok(ctx, request):
-            return _unauth()
-        data = []
-        for model, providers in sorted(ctx.router.index.items()):
-            for pid in sorted(providers):
-                data.append(
-                    {"id": model, "object": "model", "owned_by": pid, "synckey_provider": pid}
-                )
+        if not authorized(ctx, request):
+            return unauthorized()
+        data = [
+            {"id": model, "object": "model", "owned_by": pid, "synckey_provider": pid}
+            for model, providers in sorted(ctx.router.index.items())
+            for pid in sorted(providers)
+        ]
         return {"object": "list", "data": data}
 
     @app.get("/v1/usage")
     async def usage(request: Request):
-        if not _auth_ok(ctx, request):
-            return _unauth()
+        if not authorized(ctx, request):
+            return unauthorized()
         totals = ctx.db.usage_totals()
         return {
             "requests": totals["requests"] or 0,
@@ -130,95 +136,78 @@ def create_app(ctx: Context | None = None) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        return await _proxy(ctx, app.state.client, request, "/chat/completions")
+        return await forward(ctx, request, "/chat/completions")
 
     @app.post("/v1/embeddings")
     async def embeddings(request: Request):
-        return await _proxy(ctx, app.state.client, request, "/embeddings", allow_stream=False)
+        return await forward(ctx, request, "/embeddings", allow_stream=False)
 
     @app.post("/v1/completions")
     async def completions(request: Request):
-        return await _proxy(ctx, app.state.client, request, "/completions")
+        return await forward(ctx, request, "/completions")
 
     return app
 
 
-async def _proxy(
-    ctx: Context,
-    client: httpx.AsyncClient,
-    request: Request,
-    path: str,
-    allow_stream: bool = True,
-) -> JSONResponse | StreamingResponse:
-    if not _auth_ok(ctx, request):
-        return _unauth()
+def error_response(message: str, etype: str, status: int, **extra) -> JSONResponse:
+    body = {"error": {"message": message, "type": etype, **extra}}
+    return JSONResponse(body, status_code=status)
+
+
+async def forward(
+    ctx: Context, request: Request, path: str, allow_stream: bool = True
+) -> Response:
+    if not authorized(ctx, request):
+        return unauthorized()
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(
-            {"error": {"message": "Body must be valid JSON.", "type": "invalid_request_error"}},
-            status_code=400,
-        )
+        return error_response("Body must be valid JSON.", "invalid_request_error", 400)
 
     model = body.get("model")
     if not model:
-        return JSONResponse(
-            {"error": {"message": "Field 'model' is required.", "type": "invalid_request_error"}},
-            status_code=400,
-        )
+        return error_response("Field 'model' is required.", "invalid_request_error", 400)
 
     resolution = ctx.router.resolve(str(model))
     if not resolution.providers:
-        return JSONResponse(
-            {
-                "error": {
-                    "message": (
-                        f"Could not route model '{model}'. No configured provider advertises it. "
-                        "Try a 'provider/model' prefix, or run `synckey models --refresh`."
-                    ),
-                    "type": "not_found_error",
-                }
-            },
-            status_code=404,
+        return error_response(
+            f"Could not route model '{model}'. No configured provider advertises it. "
+            "Use a 'provider/model' prefix or run `synckey models --refresh`.",
+            "not_found_error",
+            404,
         )
 
     body["model"] = resolution.bare_model
     stream = bool(body.get("stream")) and allow_stream
     if stream:
-        # Ask upstream to emit a final usage chunk so we can meter streams.
         opts = body.get("stream_options") or {}
         opts["include_usage"] = True
         body["stream_options"] = opts
 
-    plan = _build_plan(ctx, resolution, ctx.settings.max_retries)
-    if not plan:
-        return JSONResponse(
-            {
-                "error": {
-                    "message": (
-                        f"Model '{model}' routes to {resolution.providers} but no keys are "
-                        "configured for those providers. Add one with `synckey key add`."
-                    ),
-                    "type": "configuration_error",
-                }
-            },
-            status_code=503,
+    attempts = plan_attempts(ctx, resolution, ctx.settings.max_retries)
+    if not attempts:
+        return error_response(
+            f"Model '{model}' routes to {resolution.providers} but no keys are configured "
+            "for those providers. Add one with `synckey key add`.",
+            "configuration_error",
+            503,
         )
 
-    last_error: dict | None = None
+    client: httpx.AsyncClient = request.app.state.client
+    writer: UsageWriter = request.app.state.writer
+
+    last_error = "unknown error"
     last_status = 502
-    for attempt in plan:
+    for attempt in attempts:
         url = attempt.provider.base_url.rstrip("/") + path
-        headers = {"Content-Type": "application/json"}
-        headers.update(attempt.provider.auth_headers(attempt.secret))
+        headers = {"Content-Type": "application/json", **attempt.provider.auth_headers(attempt.secret)}
         params = attempt.provider.auth_params(attempt.secret)
-        ctx.db.mark_attempt(attempt.key_id)
         started = time.perf_counter()
 
         if stream:
-            result = await _try_stream(
-                ctx, client, url, headers, params, body, attempt, resolution, started
+            result = await open_stream(
+                ctx, writer, client, url, headers, params, body, attempt, resolution, started
             )
             if result is not None:
                 return result
@@ -228,86 +217,91 @@ async def _proxy(
             resp = await client.post(url, json=body, headers=headers, params=params)
         except httpx.HTTPError as exc:
             ctx.pool.report_failure(attempt.key_id)
-            last_error = {"message": f"Upstream error from {attempt.provider_id}: {exc}"}
-            last_status = 502
+            last_error, last_status = f"upstream error from {attempt.provider_id}: {exc}", 502
             continue
 
         latency = int((time.perf_counter() - started) * 1000)
 
         if resp.status_code == 200:
-            payload = resp.json()
-            usage = payload.get("usage") or {}
             ctx.pool.report_success(attempt.key_id)
-            ctx.db.record_usage(
+            tokens = read_usage(resp.content)
+            writer.record(
                 provider=attempt.provider_id,
                 model=resolution.bare_model,
                 key_id=attempt.key_id,
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0),
-                total_tokens=usage.get("total_tokens", 0),
+                prompt_tokens=tokens[0],
+                completion_tokens=tokens[1],
+                total_tokens=tokens[2],
                 status_code=200,
                 latency_ms=latency,
             )
-            return JSONResponse(payload, status_code=200)
+            # Pass the upstream bytes straight through, no re-serialization.
+            return Response(content=resp.content, media_type="application/json")
 
-        # Non-200: decide whether to eat-and-retry or surface.
-        retriable, err_body = _handle_failure(ctx, attempt, resp, resolution, latency)
-        last_error, last_status = err_body, resp.status_code
+        retriable, err_text = classify_failure(ctx, writer, attempt, resp, resolution, latency)
+        last_error, last_status = err_text, resp.status_code
         if not retriable:
-            return JSONResponse(err_body, status_code=resp.status_code)
-        # else fall through to next attempt
+            return Response(
+                content=resp.content, media_type="application/json", status_code=resp.status_code
+            )
 
-    return JSONResponse(
-        {
-            "error": {
-                "message": (
-                    f"All {len(plan)} key/provider attempts failed for '{model}'. "
-                    f"Last: {(last_error or {}).get('message', 'unknown error')}"
-                ),
-                "type": "upstream_exhausted",
-                "providers_tried": resolution.providers,
-            }
-        },
-        status_code=last_status if last_status >= 400 else 502,
+    return error_response(
+        f"All {len(attempts)} key/provider attempts failed for '{model}'. Last: {last_error}",
+        "upstream_exhausted",
+        last_status if last_status >= 400 else 502,
+        providers_tried=resolution.providers,
     )
 
 
-def _handle_failure(
-    ctx: Context, attempt: Attempt, resp: httpx.Response, resolution: Resolution, latency: int
-) -> tuple[bool, dict]:
-    """Classify a non-200 response. Returns (retriable, error_body)."""
+def read_usage(content: bytes) -> tuple[int, int, int]:
+    """Pull (prompt, completion, total) tokens from a JSON response body."""
     try:
-        err_body = resp.json()
-    except Exception:
-        err_body = {"error": {"message": resp.text[:500] or "upstream error"}}
+        usage = json.loads(content).get("usage") or {}
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+    return (
+        usage.get("prompt_tokens", 0),
+        usage.get("completion_tokens", 0),
+        usage.get("total_tokens", 0),
+    )
 
-    ctx.db.record_usage(
+
+def classify_failure(
+    ctx: Context,
+    writer: UsageWriter,
+    attempt: Attempt,
+    resp: httpx.Response,
+    resolution: Resolution,
+    latency: int,
+) -> tuple[bool, str]:
+    """Decide whether a non-200 should be retried. Returns (retriable, message)."""
+    text = resp.text[:300]
+    writer.record(
         provider=attempt.provider_id,
         model=resolution.bare_model,
         key_id=attempt.key_id,
         status_code=resp.status_code,
         latency_ms=latency,
-        error=json.dumps(err_body)[:500],
+        error=text,
     )
 
     if resp.status_code == 429:
-        retry_after = parse_retry_after(resp.headers.get("retry-after"))
-        ctx.pool.report_rate_limit(attempt.key_id, retry_after)
-        return True, err_body
+        ctx.pool.report_rate_limit(attempt.key_id, parse_retry_after(resp.headers.get("retry-after")))
+        return True, text
     if resp.status_code >= 500:
         ctx.pool.report_failure(attempt.key_id)
-        return True, err_body
+        return True, text
     if resp.status_code in (401, 403):
-        # Bad credential: cool it hard so the pool stops picking it, but keep
-        # trying other keys/providers.
+        # Bad credential: cool it hard so the pool stops choosing it, keep trying others.
         ctx.pool.report_rate_limit(attempt.key_id, 300.0)
-        return True, err_body
-    # Other 4xx (e.g. malformed request): the request itself is the problem.
-    return False, err_body
+        return True, text
+    # Other 4xx means the request itself is bad; do not burn more keys on it.
+    return False, text
 
 
-async def _try_stream(
+async def open_stream(
     ctx: Context,
+    writer: UsageWriter,
     client: httpx.AsyncClient,
     url: str,
     headers: dict,
@@ -317,8 +311,8 @@ async def _try_stream(
     resolution: Resolution,
     started: float,
 ) -> StreamingResponse | None:
-    """Open an upstream stream. Returns a StreamingResponse on success, or
-    ``None`` to signal the caller to try the next attempt."""
+    """Open an upstream SSE stream. Returns a response on success, else None to
+    try the next attempt."""
     req = client.build_request("POST", url, json=body, headers=headers, params=params)
     try:
         resp = await client.send(req, stream=True)
@@ -329,14 +323,14 @@ async def _try_stream(
     if resp.status_code != 200:
         latency = int((time.perf_counter() - started) * 1000)
         await resp.aread()
-        _handle_failure(ctx, attempt, resp, resolution, latency)
+        classify_failure(ctx, writer, attempt, resp, resolution, latency)
         await resp.aclose()
         return None
 
     ctx.pool.report_success(attempt.key_id)
 
-    async def gen() -> AsyncIterator[bytes]:
-        prompt_t = completion_t = total_t = 0
+    async def stream_body() -> AsyncIterator[bytes]:
+        prompt = completion = total = 0
         try:
             async for line in resp.aiter_lines():
                 if line.startswith("data: "):
@@ -344,29 +338,26 @@ async def _try_stream(
                     if chunk and chunk != "[DONE]":
                         try:
                             obj = json.loads(chunk)
-                            if isinstance(obj.get("usage"), dict):
-                                u = obj["usage"]
-                                prompt_t = u.get("prompt_tokens", prompt_t)
-                                completion_t = u.get("completion_tokens", completion_t)
-                                total_t = u.get("total_tokens", total_t)
+                            u = obj.get("usage")
+                            if isinstance(u, dict):
+                                prompt = u.get("prompt_tokens", prompt)
+                                completion = u.get("completion_tokens", completion)
+                                total = u.get("total_tokens", total)
                         except ValueError:
                             pass
                 yield (line + "\n").encode("utf-8")
-                if not line:
-                    continue
         finally:
             await resp.aclose()
-            latency = int((time.perf_counter() - started) * 1000)
-            ctx.db.record_usage(
+            writer.record(
                 provider=attempt.provider_id,
                 model=resolution.bare_model,
                 key_id=attempt.key_id,
-                prompt_tokens=prompt_t,
-                completion_tokens=completion_t,
-                total_tokens=total_t,
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                total_tokens=total,
                 status_code=200,
-                latency_ms=latency,
+                latency_ms=int((time.perf_counter() - started) * 1000),
                 stream=True,
             )
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(stream_body(), media_type="text/event-stream")

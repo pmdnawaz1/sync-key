@@ -44,11 +44,7 @@ class Context:
         self.router = Router(self.db, self.providers, self.settings)
 
     def first_secret(self, provider_id: str) -> str | None:
-        """A single usable secret for a provider (for discovery / health checks).
-
-        Falls back to environment variables when no key is stored, so discovery
-        works before anything is persisted.
-        """
+        """A usable secret for discovery, falling back to environment variables."""
         keys = self.db.list_keys(provider=provider_id, enabled_only=True)
         if keys:
             return self.box.open(keys[0].secret)

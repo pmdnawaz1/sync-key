@@ -1,13 +1,13 @@
-"""Configuration & paths.
+"""Configuration and paths.
 
-State lives under ``$SYNCKEY_HOME`` (default ``~/.synckey``):
+State lives under $SYNCKEY_HOME (default ~/.synckey):
 
-    secret.key      Fernet key for sealing provider credentials (0600)
-    synckey.db      SQLite: keys, usage, runtime key state, metadata
-    config.toml     User settings + custom providers
+    secret.key   Fernet key for sealing provider credentials (0600)
+    synckey.db   SQLite: keys, usage, metadata
+    config.toml  user settings and custom providers
 
-The unified gateway key is generated once at ``init`` time; only its SHA-256
-hash is persisted, so the plaintext is shown exactly once.
+The unified gateway key is generated once at init time; only its SHA-256 hash
+is persisted, so the plaintext is shown exactly once.
 """
 
 from __future__ import annotations
@@ -41,16 +41,18 @@ def config_path() -> Path:
 class Settings:
     host: str = "127.0.0.1"
     port: int = 8787
-    # Routing: ordered preference when several providers serve the same model.
+    # Ordered preference when several providers serve the same model.
     provider_priority: list[str] = field(default_factory=list)
-    # Allow falling back to a *different* provider when every key for the
-    # detected provider is rate-limited / failing.
+    # Fall back to a different provider when every key for the first one fails.
     cross_provider_fallback: bool = True
-    # Per-request retry budget across the whole key pool.
+    # Per-request attempt budget across the whole key pool.
     max_retries: int = 4
-    # Default cooldown (seconds) applied to a key on 429 with no Retry-After.
+    # Cooldown (seconds) applied to a key on 429 with no Retry-After.
     default_cooldown: float = 20.0
     request_timeout: float = 120.0
+    # Outbound connection pool limits, sized for high concurrency on one core.
+    max_connections: int = 600
+    max_keepalive: int = 300
     custom_providers: list[dict] = field(default_factory=list)
 
     @classmethod
@@ -65,6 +67,8 @@ class Settings:
             host=gw.get("host", cls.host),
             port=gw.get("port", cls.port),
             request_timeout=gw.get("request_timeout", cls.request_timeout),
+            max_connections=gw.get("max_connections", cls.max_connections),
+            max_keepalive=gw.get("max_keepalive", cls.max_keepalive),
             provider_priority=routing.get("priority", []),
             cross_provider_fallback=routing.get("cross_provider_fallback", True),
             max_retries=routing.get("max_retries", cls.max_retries),
@@ -78,7 +82,7 @@ def ensure_home() -> Path:
     h.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(h, 0o700)
-    except OSError:  # pragma: no cover - non-posix
+    except OSError:
         pass
     return h
 

@@ -1,18 +1,8 @@
 """Built-in provider registry.
 
-Every provider here exposes an OpenAI-compatible REST surface, so a single
-adapter (one base URL + a Bearer key) can talk to all of them.  Each provider
-declares:
-
-* ``base_url``       – OpenAI-compatible root (``/chat/completions`` is appended)
-* ``models_path``    – relative path for the model-listing endpoint
-* ``env``            – env vars commonly used for that provider's key
-* ``patterns``       – regexes used for static model -> provider auto-detection
-* ``auth``           – how the credential is attached to outbound requests
-* ``signup``         – where a user gets a key (shown in the CLI)
-
-The registry is intentionally data-only so it can be merged with user-defined
-providers from config without special-casing.
+Every provider exposes an OpenAI-compatible REST surface, so one adapter (base
+URL plus a bearer key) reaches all of them. Patterns are compiled once at
+construction and only used as a fallback when prefix and live-index routing miss.
 """
 
 from __future__ import annotations
@@ -22,25 +12,24 @@ from dataclasses import dataclass, field
 from typing import Pattern
 
 
-@dataclass(frozen=True)
+@dataclass
 class Provider:
     id: str
     name: str
     base_url: str
     models_path: str = "/models"
     env: tuple[str, ...] = ()
-    # Raw regex strings; compiled lazily into ``_compiled``.
     patterns: tuple[str, ...] = ()
     auth: str = "bearer"  # "bearer" | "x-api-key" | "query:<param>"
     signup: str = ""
     notes: str = ""
+    _rx: list[Pattern[str]] = field(default_factory=list, init=False, repr=False, compare=False)
 
-    @property
-    def compiled(self) -> list[Pattern[str]]:
-        return [re.compile(p, re.IGNORECASE) for p in self.patterns]
+    def __post_init__(self) -> None:
+        self._rx = [re.compile(p, re.IGNORECASE) for p in self.patterns]
 
     def matches(self, model: str) -> bool:
-        return any(rx.search(model) for rx in self.compiled)
+        return any(rx.search(model) for rx in self._rx)
 
     def auth_headers(self, secret: str) -> dict[str, str]:
         if self.auth == "bearer":
@@ -55,12 +44,8 @@ class Provider:
         return {}
 
 
-# --- Built-in providers ------------------------------------------------------
-# Patterns are deliberately conservative: they only claim models that are
-# *unambiguously* owned by a provider.  Shared open-weight names (llama, qwen,
-# deepseek...) are resolved at runtime via the live model index instead, so we
-# don't hard-code a wrong guess.
-
+# Patterns only claim models a provider unambiguously owns. Shared open-weight
+# names (llama, qwen, deepseek) are resolved at runtime via the live index.
 BUILTIN: dict[str, Provider] = {
     p.id: p
     for p in (
@@ -68,7 +53,6 @@ BUILTIN: dict[str, Provider] = {
             id="gemini",
             name="Google Gemini",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-            models_path="/models",
             env=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
             patterns=(r"^gemini[-/]", r"^gemma[-/]?", r"^learnlm", r"^text-embedding-00"),
             signup="https://aistudio.google.com/apikey",
@@ -178,7 +162,6 @@ BUILTIN: dict[str, Provider] = {
             base_url="http://localhost:11434/v1",
             env=("OLLAMA_HOST",),
             patterns=(r"^ollama/",),
-            auth="bearer",
             signup="https://ollama.com",
             notes="No key required for a default local install.",
         ),
@@ -186,12 +169,11 @@ BUILTIN: dict[str, Provider] = {
 }
 
 
-def explicit_prefix(model: str, known_ids: set[str]) -> tuple[str | None, str]:
-    """Split a ``provider/model`` prefix when the prefix is a known provider.
+def split_provider_prefix(model: str, known_ids: set[str]) -> tuple[str | None, str]:
+    """Split a provider/model prefix when the head is a registered provider.
 
-    Returns ``(provider_id, bare_model)``.  Org-namespaced names such as
-    ``meta/llama-3.3-70b-instruct`` are *not* treated as a provider prefix
-    because ``meta`` is not a registered provider, so they pass through intact.
+    Org-namespaced names like meta/llama-3.3-70b are left intact because meta is
+    not a registered provider.
     """
     if "/" in model:
         head, tail = model.split("/", 1)
@@ -200,8 +182,7 @@ def explicit_prefix(model: str, known_ids: set[str]) -> tuple[str | None, str]:
     return None, model
 
 
-def detect_by_pattern(model: str, providers: dict[str, Provider]) -> str | None:
-    """Best-effort static detection from the model name alone."""
+def match_by_pattern(model: str, providers: dict[str, Provider]) -> str | None:
     for pid, prov in providers.items():
         if prov.matches(model):
             return pid

@@ -1,20 +1,15 @@
-"""The key pool: round-robin selection with rate-limit eating.
+"""Key pool: round-robin selection with rate-limit eating.
 
-Goals:
-* Spread load across every enabled key for a provider (round-robin, weighted).
-* When a key gets 429'd or errors, put it on a cooldown (honoring
-  ``Retry-After``) and *immediately* hand the caller the next live key.
-* Persist cooldown / health to SQLite so restarts and the CLI agree on state.
-
-The pool is provider-scoped: callers ask for an ordered list of candidate keys
-for a provider and try them in order until one succeeds.
+Runtime state (cooldowns, failure counts, rotation cursor) lives in memory, and
+decrypted secrets are cached, so picking a key never hits the database or runs a
+Fernet decrypt on the hot path. The key roster is read from SQLite per call,
+which is a cheap WAL read and keeps the pool in sync when the CLI changes keys.
 """
 
 from __future__ import annotations
 
-import itertools
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .crypto import SecretBox
 from .db import Database, KeyRecord
@@ -29,41 +24,50 @@ class Candidate:
     cooldown_remaining: float
 
 
+@dataclass
+class KeyState:
+    cooldown_until: float = 0.0
+    consecutive_failures: int = 0
+
+
 class KeyPool:
     def __init__(self, db: Database, box: SecretBox, default_cooldown: float = 20.0):
         self.db = db
         self.box = box
         self.default_cooldown = default_cooldown
-        # Per-provider monotonically increasing rotation cursor.
-        self._cursors: dict[str, itertools.count] = {}
+        self._state: dict[int, KeyState] = {}
+        self._secrets: dict[int, str] = {}
+        self._cursor: dict[str, int] = {}
 
-    def _cursor(self, provider: str) -> int:
-        if provider not in self._cursors:
-            self._cursors[provider] = itertools.count()
-        return next(self._cursors[provider])
+    def _secret_for(self, rec: KeyRecord) -> str:
+        cached = self._secrets.get(rec.id)
+        if cached is None:
+            cached = self.box.open(rec.secret)
+            self._secrets[rec.id] = cached
+        return cached
+
+    def _state_for(self, key_id: int) -> KeyState:
+        st = self._state.get(key_id)
+        if st is None:
+            st = KeyState()
+            self._state[key_id] = st
+        return st
 
     def candidates(self, provider: str) -> list[Candidate]:
-        """Return live-first, round-robin-ordered candidates for a provider.
-
-        Available (non-cooling) keys come first, rotated so consecutive calls
-        start at a different key.  Keys still in cooldown are appended last,
-        ordered by who frees up soonest — a usable fallback if everything is
-        currently throttled.
-        """
-        now = time.time()
+        """Live keys first (round-robin), then cooling keys soonest-free first."""
         records = self.db.list_keys(provider=provider, enabled_only=True)
         if not records:
             return []
 
-        # Weighted expansion: a key with weight N appears N times so it gets a
-        # proportionally larger share of the rotation.
-        expanded: list[KeyRecord] = []
+        weighted: list[KeyRecord] = []
         for r in records:
-            expanded.extend([r] * max(1, r.weight))
+            weighted.extend([r] * max(1, r.weight))
 
-        start = self._cursor(provider) % len(expanded)
-        rotated = expanded[start:] + expanded[:start]
+        start = self._cursor.get(provider, 0) % len(weighted)
+        self._cursor[provider] = start + 1
+        rotated = weighted[start:] + weighted[:start]
 
+        now = time.time()
         available: list[Candidate] = []
         cooling: list[Candidate] = []
         seen: set[int] = set()
@@ -71,13 +75,11 @@ class KeyPool:
             if r.id in seen:
                 continue
             seen.add(r.id)
-            state = self.db.get_state(r.id)
-            cooldown_until = state["cooldown_until"] if state else 0.0
-            remaining = max(0.0, cooldown_until - now)
+            remaining = max(0.0, self._state_for(r.id).cooldown_until - now)
             cand = Candidate(
                 key_id=r.id,
                 label=r.label,
-                secret=self.box.open(r.secret),
+                secret=self._secret_for(r),
                 cooling=remaining > 0,
                 cooldown_remaining=remaining,
             )
@@ -86,24 +88,23 @@ class KeyPool:
         cooling.sort(key=lambda c: c.cooldown_remaining)
         return available + cooling
 
-    # --- outcome reporting ---------------------------------------------------
     def report_success(self, key_id: int) -> None:
-        self.db.mark_success(key_id)
+        self._state_for(key_id).consecutive_failures = 0
 
     def report_rate_limit(self, key_id: int, retry_after: float | None = None) -> None:
+        st = self._state_for(key_id)
         cooldown = retry_after if retry_after and retry_after > 0 else self.default_cooldown
-        self.db.mark_cooldown(key_id, time.time() + cooldown)
+        st.cooldown_until = time.time() + cooldown
+        st.consecutive_failures += 1
 
     def report_failure(self, key_id: int, backoff: float | None = None) -> None:
-        """Transient server error: short, escalating cooldown."""
-        state = self.db.get_state(key_id)
-        fails = (state["consecutive_failures"] if state else 0) + 1
-        delay = backoff if backoff is not None else min(self.default_cooldown, 2.0 * fails)
-        self.db.mark_cooldown(key_id, time.time() + delay)
+        st = self._state_for(key_id)
+        st.consecutive_failures += 1
+        delay = backoff if backoff is not None else min(self.default_cooldown, 2.0 * st.consecutive_failures)
+        st.cooldown_until = time.time() + delay
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """Parse a ``Retry-After`` header (seconds form only; HTTP-date is rare here)."""
     if not value:
         return None
     try:

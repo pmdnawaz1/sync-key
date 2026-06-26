@@ -1,8 +1,8 @@
-"""SQLite persistence: credentials, usage records, runtime key state, metadata.
+"""SQLite persistence: credentials, usage records, metadata.
 
-A thin synchronous wrapper is fine here — SQLite writes are fast and the
-gateway records usage off the hot path.  WAL mode keeps the CLI readable while
-the server writes.
+Reads happen on the request path (the key roster) and stay cheap under WAL.
+Usage writes never touch this connection on the hot path; they go through the
+batched background writer in usage.py, which owns its own connection.
 """
 
 from __future__ import annotations
@@ -23,19 +23,10 @@ CREATE TABLE IF NOT EXISTS keys (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     provider   TEXT NOT NULL,
     label      TEXT NOT NULL,
-    secret     BLOB NOT NULL,           -- Fernet-sealed
+    secret     BLOB NOT NULL,
     enabled    INTEGER NOT NULL DEFAULT 1,
     weight     INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS key_state (
-    key_id               INTEGER PRIMARY KEY REFERENCES keys(id) ON DELETE CASCADE,
-    cooldown_until       REAL NOT NULL DEFAULT 0,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    total_requests       INTEGER NOT NULL DEFAULT 0,
-    total_failures       INTEGER NOT NULL DEFAULT 0,
-    last_used            REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS usage (
@@ -54,9 +45,22 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
-CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider);
+CREATE INDEX IF NOT EXISTS idx_usage_key ON usage(key_id);
 CREATE INDEX IF NOT EXISTS idx_keys_provider ON keys(provider);
 """
+
+USAGE_COLUMNS = (
+    "ts, provider, model, key_id, prompt_tokens, completion_tokens, "
+    "total_tokens, status_code, latency_ms, stream, error"
+)
+USAGE_INSERT = f"INSERT INTO usage({USAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+
+
+def tune(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA temp_store=MEMORY")
 
 
 @dataclass
@@ -80,15 +84,14 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        tune(self.conn)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
 
-    # --- meta ----------------------------------------------------------------
+    # meta
     def set_meta(self, name: str, value: str) -> None:
         self.conn.execute(
             "INSERT INTO meta(name, value) VALUES(?, ?) "
@@ -101,17 +104,14 @@ class Database:
         row = self.conn.execute("SELECT value FROM meta WHERE name=?", (name,)).fetchone()
         return row["value"] if row else None
 
-    # --- keys ----------------------------------------------------------------
+    # keys
     def add_key(self, provider: str, label: str, secret: bytes, weight: int = 1) -> int:
         cur = self.conn.execute(
-            "INSERT INTO keys(provider, label, secret, weight, created_at) "
-            "VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO keys(provider, label, secret, weight, created_at) VALUES(?,?,?,?,?)",
             (provider, label, secret, weight, time.time()),
         )
-        key_id = int(cur.lastrowid)
-        self.conn.execute("INSERT INTO key_state(key_id) VALUES(?)", (key_id,))
         self.conn.commit()
-        return key_id
+        return int(cur.lastrowid)
 
     def remove_key(self, key_id: int) -> bool:
         cur = self.conn.execute("DELETE FROM keys WHERE id=?", (key_id,))
@@ -133,7 +133,6 @@ class Database:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY provider, id"
-        rows = self.conn.execute(sql, params).fetchall()
         return [
             KeyRecord(
                 id=r["id"],
@@ -144,7 +143,7 @@ class Database:
                 weight=r["weight"],
                 created_at=r["created_at"],
             )
-            for r in rows
+            for r in self.conn.execute(sql, params).fetchall()
         ]
 
     def providers_with_keys(self) -> list[str]:
@@ -153,76 +152,23 @@ class Database:
         ).fetchall()
         return [r["provider"] for r in rows]
 
-    # --- key state -----------------------------------------------------------
-    def get_state(self, key_id: int) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM key_state WHERE key_id=?", (key_id,)).fetchone()
+    def key_request_counts(self) -> dict[int, tuple[int, int]]:
+        """Map key_id -> (requests, errors), derived from the usage log."""
+        rows = self.conn.execute(
+            "SELECT key_id, COUNT(*) AS reqs, "
+            "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) AS errs "
+            "FROM usage WHERE key_id IS NOT NULL GROUP BY key_id"
+        ).fetchall()
+        return {r["key_id"]: (r["reqs"], r["errs"] or 0) for r in rows}
 
-    def mark_cooldown(self, key_id: int, until: float) -> None:
-        self.conn.execute(
-            "UPDATE key_state SET cooldown_until=?, consecutive_failures=consecutive_failures+1, "
-            "total_failures=total_failures+1 WHERE key_id=?",
-            (until, key_id),
-        )
-        self.conn.commit()
-
-    def mark_success(self, key_id: int) -> None:
-        self.conn.execute(
-            "UPDATE key_state SET consecutive_failures=0, last_used=?, "
-            "total_requests=total_requests+1 WHERE key_id=?",
-            (time.time(), key_id),
-        )
-        self.conn.commit()
-
-    def mark_attempt(self, key_id: int) -> None:
-        self.conn.execute(
-            "UPDATE key_state SET last_used=?, total_requests=total_requests+1 WHERE key_id=?",
-            (time.time(), key_id),
-        )
-        self.conn.commit()
-
-    # --- usage ---------------------------------------------------------------
-    def record_usage(
-        self,
-        *,
-        provider: str,
-        model: str,
-        key_id: int | None,
-        prompt_tokens: int = 0,
-        completion_tokens: int = 0,
-        total_tokens: int = 0,
-        status_code: int = 0,
-        latency_ms: int = 0,
-        stream: bool = False,
-        error: str | None = None,
-    ) -> None:
-        self.conn.execute(
-            "INSERT INTO usage(ts, provider, model, key_id, prompt_tokens, completion_tokens, "
-            "total_tokens, status_code, latency_ms, stream, error) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                time.time(),
-                provider,
-                model,
-                key_id,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                status_code,
-                latency_ms,
-                1 if stream else 0,
-                error,
-            ),
-        )
-        self.conn.commit()
-
+    # usage reads
     def usage_summary(self, since: float | None = None) -> list[sqlite3.Row]:
         sql = (
             "SELECT provider, model, COUNT(*) AS requests, "
             "SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, "
             "SUM(total_tokens) AS total_tokens, "
             "SUM(CASE WHEN status_code>=400 OR error IS NOT NULL THEN 1 ELSE 0 END) AS errors, "
-            "AVG(latency_ms) AS avg_latency "
-            "FROM usage"
+            "AVG(latency_ms) AS avg_latency FROM usage"
         )
         params: list = []
         if since is not None:
@@ -244,7 +190,7 @@ class Database:
             params.append(since)
         return self.conn.execute(sql, params).fetchone()
 
-    def recent_usage(self, limit: int = 20) -> list[sqlite3.Row]:
+    def recent_usage(self, limit: int = 25) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM usage ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()

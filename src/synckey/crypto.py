@@ -1,9 +1,8 @@
 """At-rest encryption for stored provider secrets.
 
-A single symmetric key lives in ``~/.synckey/secret.key`` with 0600 perms.
-Provider credentials are sealed with Fernet (AES-128-CBC + HMAC) so the SQLite
-database never holds plaintext keys.  If the secret file is lost the stored
-credentials are unrecoverable by design — re-add them.
+One symmetric key lives in ~/.synckey/secret.key with 0600 perms. Provider
+credentials are sealed with Fernet so the database never holds plaintext. Lose
+the secret file and the stored credentials are unrecoverable by design.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ class SecretBox:
             return self.key_path.read_bytes()
         self.key_path.parent.mkdir(parents=True, exist_ok=True)
         key = Fernet.generate_key()
-        # Write with restrictive perms before any content lands on disk.
         fd = os.open(self.key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(key)
@@ -36,7 +34,7 @@ class SecretBox:
     def open(self, token: bytes) -> str:
         try:
             return self._fernet.decrypt(token).decode("utf-8")
-        except InvalidToken as exc:  # pragma: no cover - corruption path
+        except InvalidToken as exc:
             raise RuntimeError(
                 "Could not decrypt a stored secret. The secret.key file may have "
                 "changed. Re-add affected keys with `synckey key add`."
