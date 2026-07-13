@@ -3,249 +3,248 @@
 **Merge every AI provider key behind one unified, OpenAI-compatible API key.**
 
 Gemini, Groq, NVIDIA, GitHub Models, Cerebras, Cohere, Mistral, DeepSeek, xAI,
-OpenAI, OpenRouter, Together, SambaNova, Ollama — and any custom OpenAI-compatible
-provider — all behind a single key you point your OpenAI SDK at.
+OpenAI, OpenRouter, Together, SambaNova, Ollama and any custom OpenAI-compatible
+provider all behind a single key you point your OpenAI SDK at.
 
 No frontend. No Redis. Just a CLI and a fast local gateway.
 
 ```
-                         ┌──────────────────────────────────────────┐
-  your app               │           synckey gateway                │
-  (OpenAI SDK) ──────────▶  auth → route → key pool → failover     │──▶ Groq
-  base_url=:8787/v1      │         ▲           │                    │──▶ Gemini
-  api_key=sk-synckey-... │         │           ▼                    │──▶ Cerebras
-                         │   model index   token metering (SQLite)  │──▶ Cohere …
-                         └──────────────────────────────────────────┘
+                           your app
+                    ┌────── (OpenAI SDK) ───────┐
+                    │                           │
+                    ▼                           │
+    base_url: http://127.0.0.1:8787/v1          │
+    api_key: sk-synckey-...                     │
+                    │                           │
+                    ▼                           │
+┌──────────────────────────────────────────┐   │
+│           synckey gateway                  │◀──┘
+│                                          │
+│  1. auth        ────► your app           │
+│  2. resolve     ────► model + providers   │
+│  3. route       ────► key pool            │
+│  4. failover    ────► tier fallback      │
+│  5. forward     ────► upstream provider   │
+│  6. stream/log  ────► response            │
+└──────────────────────────────────────────┘
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+        Groq          Gemini         Cerebras
+        (key #1)      (key #1)       (key #1)
 ```
 
 ---
 
-## First 5 minutes
+## Quick start
 
 ```bash
-py -m venv .venv && .venv\Scripts\activate && pip install -e .
+# Option A: Install in a virtual environment (recommended)
+py -m venv .venv && .venv\Scripts\activate
+pip install -e .
 
+# Option B: Install system-wide
+pip install .
+```
+
+**After system-wide install**, add the Python Scripts directory to your PATH:
+
+**cmd.exe:**
+```cmd
+setx PATH "%PATH%;C:\Users\pmdna\AppData\Local\Python\pythoncore-3.14-64\Scripts"
+```
+*(Restart cmd for the change to take effect, or run `set PATH=%PATH%;C:\Users\pmdna\AppData\Local\Python\pythoncore-3.14-64\Scripts` for just that session)*
+
+**PowerShell / Bash (Git Bash, WSL, etc.):**
+```bash
+export PATH="$PATH:/c/Users/pmdna/AppData/Local/Python/pythoncore-3.14-64/Scripts"
+```
+*(Add to ~/.bashrc or ~/.zshrc to persist)*
+
+Then run the guided setup:
+
+```bash
 synckey setup     # guided: mint key → add provider keys → fetch models → set defaults
 synckey serve     # start the gateway
 ```
 
-`synckey setup` walks you through everything interactively. It mints your unified
-key (shown once — store it), lets you paste keys for each provider (single,
-comma-separated, or a file), offers to fetch the models those keys can actually
-call, and asks for a **default model** so clients can stay simple.
+`synckey setup` walks you through it interactively. It:
+1. Mints your unified key (shown once **store it safely**)
+2. Collects provider API keys (single, comma-separated, or `--file`)
+3. Fetches the models those keys can call
+4. Asks for a **default model** so clients can omit it
 
-Then point any OpenAI client at it:
+---
+
+## How to connect your app
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8787/v1",
-    api_key="sk-synckey-...",   # your unified key from setup
+    api_key="sk-synckey-...",   # your unified key from `synckey setup`
 )
 
-# The simplest call: no model needed if you set a default.
+# Use your default model client stays simple.
 client.chat.completions.create(messages=[{"role": "user", "content": "hi"}])
 
-# Or name a model — auto-routed to the right provider.
+# Name a model explicitly synckey routes it automatically.
 client.chat.completions.create(model="gemini-2.0-flash", messages=[...])
+
+# Prefer a specific provider (hint, not forced).
+client.chat.completions.create(
+    model="llama-3.3-70b",
+    extra_body={"provider": "groq"}      # Groq gets first dibs; others used on fallback
+)
 ```
 
-That's it. Everything below is optional refinement.
-
----
-
-## The two things that confused you, settled
-
-### 1. How does the client choose a model?
-
-You can send as much or as little as you want. The rule is **the model wins; the
-provider is a hint.**
-
-| What the client sends | What synckey does |
-|---|---|
-| `model: "gemini-2.0-flash"` | Routes by model (live index → `provider/` prefix → name pattern). |
-| `model: "groq/llama-3.3-70b"` | Explicit `provider/model` prefix — forced to that provider. |
-| `model` + `provider: "groq"` | Routes by **model**; the `provider` only moves Groq to the front of the candidate list (ignored if Groq can't serve it). |
-| `model: "default"` *or* model omitted | Uses the **global default model**. |
-| `model` omitted + `provider: "groq"` | Uses **Groq's default model**. |
-| `model: "fast"` (an alias) | Expands the alias, then routes. |
-
-Plus any normal OpenAI fields (`temperature`, `max_tokens`, `stream`, …) pass
-straight through. `provider` is a synckey-only hint and is stripped before the
-request reaches the upstream.
-
-```python
-# All valid:
-client.chat.completions.create(messages=[...])                                   # global default
-client.chat.completions.create(model="default", extra_body={"provider": "groq"}) # groq's default
-client.chat.completions.create(model="fast", messages=[...], temperature=0.2)    # alias
-client.chat.completions.create(model="claude-opus-4-8", messages=[...])          # explicit
-```
+**Via curl:**
 
 ```bash
-# Header form of the provider hint, and the per-request quality floor:
-curl :8787/v1/chat/completions -H "Authorization: Bearer sk-synckey-..." \
-  -H "X-Provider: groq" -H "X-Quality-Floor: high" \
+# Use your default model (set during setup)
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer sk-synckey-..." \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+
+# Or name a model explicitly — routes automatically
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer sk-synckey-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model": "openai/gpt-oss-120b", "messages":[{"role":"user","content":"hi"}]}'
+
+# Force a specific provider with X-Provider header
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer sk-synckey-..." \
+  -H "X-Provider: groq" \
   -d '{"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-### 2. How are defaults, tiers, and aliases configured?
+### The routing hint (`provider` / `X-Provider`)
 
-All of it via the CLI — you never hand-edit a file.
-
-```bash
-# Defaults (what runs when the client doesn't specify a model)
-synckey config set-default gemini-2.0-flash                 # global default
-synckey config provider-default groq llama-3.3-70b-versatile  # per-provider default
-
-# Aliases (friendly names clients can send as the model)
-synckey config alias fast mid          # "fast" → best live MID-tier model
-synckey config alias smart frontier    # "smart" → best live FRONTIER model
-synckey config alias cheap gemini-1.5-flash
-
-# Tiers (auto-detected; override only when synckey guesses wrong)
-synckey tier set my-fine-tuned-model frontier
-synckey tier list
-
-# See everything in one place
-synckey config
-```
-
-A default (global or per-provider) can be a **concrete model id** (`gemini-2.0-flash`),
-a **tier** (`mid`), or an **alias** (`fast`). Tiers and aliases are resolved to a
-live model at request time.
-
----
-
-## Configuring keys
-
-```bash
-# Single key (prompted, hidden)
-synckey key add groq
-
-# Many keys at once — comma-separated or from a file
-synckey key add groq --key "sk-1,sk-2,sk-3"
-synckey key add groq --file ~/groq-keys.txt     # one per line and/or comma-separated
-synckey key add groq --from-env                 # reads GROQ_API_KEY etc.
-
-# Skip the model-fetch prompt and set the default inline (good for scripts)
-synckey key add groq --key "sk-1,sk-2" --no-fetch --default llama-3.3-70b-versatile
-```
-
-After adding, `key add` offers to **fetch the models those keys can call**. If two
-keys for the same provider expose different model sets, it shows you the per-key
-difference instead of a silently merged list. Then it offers to set that
-provider's default model.
-
-| Command | What it does |
+| What you send | What synckey does |
 |---|---|
-| `synckey key add <provider>` | Store credential(s): single, `--key a,b,c`, or `--file`. Then fetch + default. |
-| `synckey key list [provider]` | Health matrix: status, RPM cap/used, requests, errors, cost. |
-| `synckey key rm <id>` | Delete a key. |
-| `synckey key enable/disable <id>` | Flip a key on/off without deleting it. |
-| `synckey key limits <id>` | Set `--rpm` / `--tpm` caps that drive the proactive bucket. |
+| `model: "gemini-2.0-flash"` | Routes by model name live index → name pattern → default |
+| `model: "groq/llama-3.3-70b"` | **Forced** to Groq (explicit prefix) |
+| `extra_body={"provider": "groq"}` | Hint: Groq first, others on fallback |
+| `model` omitted | Uses your **global default model** |
+| `model` omitted + `provider: "groq"` | Uses **Groq's default model** |
+
+`synckey detect <model>` shows exactly how any model will route.
 
 ---
 
-## How routing works
+## How routing decides
 
-1. **Explicit prefix** — `provider/model` when the prefix is a known provider id
-   (`groq/…`, `cohere/…`). Org-namespaced names like `meta/llama-3.3-70b` are left intact.
-2. **Live model index** — providers whose `/models` endpoint advertises the model,
-   ordered by your configured `priority`. Authoritative.
-3. **Name patterns** — `gemini-*` → Gemini, `command-*` → Cohere, `claude-*` → Anthropic.
+```
+client request
+     │
+     ▼
+resolve(model) → lookup live index → ordered by priority
+     │
+     ├─ explicit "provider/model"  → forced to that provider
+     ├─ known model in index       → providers in priority order
+     └─ unknown model              → name pattern match (gemini-*, command-*, etc.)
+     │
+     ▼
+key pool: pick ready key per provider, in order
+     │
+     ├─ key READY   → forward immediately
+     ├─ key THROTTLED → try anyway (may 429, caught by bucket)
+     └─ key COOLING  → skip unless no other option
+     │
+     ▼ (if all primary keys cooling > 60s)
+tier fallback: find same-tier model on another provider
+     │
+     ▼
+upstream provider response
+```
 
-Within each provider, every live key is tried before moving to the next provider.
-A `provider` hint reorders these candidates but never overrides an explicit model.
+### Routing priorities
 
-## Model quality tiers and smart fallback
+synckey tries every live key within a provider before moving to the next:
 
-synckey detects each model's quality tier automatically:
+```bash
+# Which provider wins when multiple have the model?
+synckey routing priority groq gemini   # Groq first, then Gemini
+
+# See the current order
+synckey routing priority
+```
+
+---
+
+## How failover works
+
+synckey classifies every model into a **quality tier**:
 
 | Tier | Examples |
-|------|---------|
+|------|----------|
 | FRONTIER | claude-opus-4-8, gpt-5, gemini-2.5-pro |
 | HIGH | claude-sonnet-4-6, gpt-4o, gemini-1.5-pro |
 | MID | gpt-4o-mini, llama-3.3-70b, gemini-2.0-flash |
 | LOW | gemma-2b, llama-3.2-1b |
 
-**The floor rule:** fallback chains never drop below the requested model's tier. If
-you call Claude Opus (FRONTIER), synckey will try other FRONTIER models (GPT-5,
-Gemini 2.5 Pro) but never fall to a MID OSS model.
+**The floor rule:** fallback chains **never drop below** the requested model's tier.
 
-**Override the floor per request:** `-H "X-Quality-Floor: high"`.
+```
+You call: claude-opus-4-8 (FRONTIER)
 
-**Override a tier permanently:** `synckey tier set <model> <tier>`.
+synckey tries:
+  1. claude-opus-4-8 on Anthropic      ✗ (rate limited)
+  2. gpt-5 on OpenAI                  ✗ (rate limited)
+  3. gemini-2.5-pro on Gemini         ✓ success!
 
-**Smart cooling skip:** if all keys for the primary model are cooling for > 60 s,
-synckey immediately routes to a same-tier alternative on another provider rather
-than waiting behind the cooldown.
-
-## Deferred requests (when every key is rate-limited)
-
-When no key has spare capacity for a request — every candidate is either
-provider-cooling (already 429'd) or locally bucket-throttled (the proactive
-limiter is holding it back) — synckey doesn't just 503. It **queues the request**
-and hands back a poll id. A background worker replays it through the normal
-keypool the moment a key has room, stores the response, and serves it on a later
-GET. The result is purged `ttl` seconds after it completes.
-
-```jsonc
-// POST /v1/chat/completions while everything is cooling → 202 Accepted
-{
-  "id": "defer_AbC123…",
-  "object": "deferred",
-  "status": "queued",
-  "model": "llama-3.3-70b-versatile",
-  "retry_after": 28,                       // also sent as a Retry-After header
-  "result_url": "/v1/requests/defer_AbC123…"
-}
+It will NOT fall to MID-tier models like gpt-4o-mini.
 ```
 
-Poll it after `retry_after` seconds with your unified key:
+**Override the floor per request:**
+```bash
+-H "X-Quality-Floor: high"    # refuse to use MID or LOW tier
+```
+
+**Routing presets** choose your fallback philosophy:
 
 ```bash
-curl :8787/v1/requests/defer_AbC123... -H "Authorization: Bearer sk-synckey-..."
-# → 202 + new ETA while still queued/running
-# → 200 + the actual completion once a key ran it
-# → 404 once it has been purged (TTL expired)
+# reliable: never drop tier, try hard to find same-tier alternative
+synckey routing preset reliable
+
+# cheap: prefer cheaper models, drop tiers more freely
+synckey routing preset cheap
+
+# Show current preset
+synckey routing preset
 ```
 
-Notes:
-- **Automatic** — any caller gets a 202 when keys are exhausted. (A standard
-  OpenAI SDK call will surface the 202 as an error; deferral-aware clients poll
-  `result_url`.) Turn it off with `[deferred].enabled = false` to get the old 503.
-- Deferred requests run **non-streaming**; the stored result is a complete body.
-- The queue is **durable** (SQLite): a gateway restart resumes pending jobs and
-  still serves stored responses.
+**Smart cooling skip:** if all primary keys are cooling for **> 60 seconds**, synckey immediately jumps to a same-tier alternative rather than waiting behind the cooldown.
+
+**Override a tier permanently:**
+```bash
+synckey tier set my-fine-tuned-model frontier
+synckey tier unset my-fine-tuned-model   # revert to auto-detected
+synckey tier list                         # see all overrides
+```
+
+---
+
+## Test your setup
 
 ```bash
-synckey deferred list          # queued / running / done, with ETAs
-synckey deferred get <id>      # status + stored response
+# Test a provider + model combination with N calls
+synckey test groq llama-3.3-70b-versatile 5
+
+# Shows per-call: which key used, latency, tokens, status
+# If all keys fail, shows the error and which fallback was attempted
+
+# Test which route a model would take (dry-run, no actual call)
+synckey detect gemini-2.0-flash
+
+# Health-check all stored keys
+synckey test
 ```
 
-```toml
-[deferred]
-enabled = true
-ttl = 3600          # keep a finished response this long (seconds), then purge
-poll = 5            # worker scan interval
-max_queue = 1000    # reject new deferrals beyond this many queued
-max_queue_age = 86400   # drop a job that never ran within this window
-```
-
-## Durable key health
-
-Key states persist to SQLite on every transition:
-
-- **LIVE** — healthy, bucket has capacity.
-- **COOLING** — got 429'd; cooldown tracks `Retry-After`. Auto-recovers across restarts.
-- **DEAD** — got 401/403; excluded until `synckey key enable <id>`.
-
-```bash
-synckey key list          # health, cooldown remaining, dead reason
-synckey key enable <id>   # revive a dead key after you fix it
-```
+---
 
 ## Live dashboard
 
@@ -254,9 +253,111 @@ synckey dash              # refresh every 2 seconds
 synckey dash -i 5         # every 5 seconds
 ```
 
-Interactive keys: **1** overview · **2** keys · **3** events · **p** pause ·
-**r** refresh · **q** quit. Shows totals, per-key health/burn rate, routing
-events, and recent requests.
+Four views, switch with number keys:
+
+| Key | View | What it shows |
+|-----|------|---------------|
+| **1** | Overview | Keys health + recent requests + events summary |
+| **2** | Keys | Per-key RPM, requests, cost, health status |
+| **3** | Events | Full routing events log (fallbacks, rate limits, dead keys) |
+| **4** | Routing | Last request's full resolution chain |
+
+```
+Keys: [1] overview  [2] keys  [3] events  [4] routing  [p] pause  [r] refresh  [q] quit
+```
+
+---
+
+## When keys are rate-limited (deferred requests)
+
+If **every** key is cooling or throttled, synckey queues the request instead of failing:
+
+```bash
+# Your POST gets a 202 with a poll URL
+{
+  "id": "defer_AbC123",
+  "status": "queued",
+  "result_url": "/v1/requests/defer_AbC123",
+  "retry_after": 28
+}
+
+# Poll later
+curl :8787/v1/requests/defer_AbC123 -H "Authorization: Bearer sk-synckey-..."
+# → 200 + the actual completion once a key ran it
+```
+
+```bash
+synckey deferred list     # queued / running / done, with ETAs
+synckey deferred get <id> # full status + response
+```
+
+This is **automatic** no code changes needed. Turn it off in `config.toml`:
+```toml
+[deferred]
+enabled = false   # get 503 instead of 202 when all keys are cooling
+```
+
+---
+
+## Key management
+
+```bash
+# Add a provider key
+synckey key add groq                        # prompted, hidden input
+synckey key add groq --key "sk-1,sk-2"      # comma-separated
+synckey key add groq --file ~/keys.txt      # one per line
+synckey key add groq --from-env             # reads GROQ_API_KEY
+
+# After adding, synckey fetches the models your key can call
+# and offers to set that provider's default model
+
+# Manage keys
+synckey key list              # health, RPM, requests, cost, cooldown remaining
+synckey key rm <id>           # delete
+synckey key disable <id>      # turn off without deleting (revive with enable)
+synckey key limits <id> --rpm 100 --tpm 100000   # set rate caps
+synckey key health            # health-check all stored keys
+```
+
+Key states persist across restarts:
+- **LIVE** healthy, bucket has capacity
+- **COOLING** got 429'd, tracks `Retry-After` header
+- **DEAD** got 401/403, excluded until re-enabled
+
+---
+
+## Defaults and aliases
+
+A default can be:
+- A **model id** — e.g. `gemini-2.0-flash` or `llama-3.3-70b-versatile`
+- A **tier** — `frontier`, `high`, `mid`, or `low` — synckey picks the best available model at that tier
+- An **alias** — a name you define that maps to a model or tier
+
+```bash
+synckey config set-default gemini-2.0-flash       # specific model
+synckey config set-default mid                    # best MID-tier model available
+synckey config set-default fast                    # an alias you've defined
+
+synckey config provider-default groq llama-3.3-70b-versatile  # per-provider
+synckey config alias fast mid                      # "fast" → best MID-tier model
+synckey config alias smart frontier                # "smart" → best FRONTIER model
+synckey config unalias fast
+
+synckey config             # see everything in one place
+```
+
+**Tiers** (auto-detected for every model):
+
+| Tier | What it means | Example models |
+|------|--------------|----------------|
+| `frontier` | Best quality | claude-opus-4-8, gpt-5, gemini-2.5-pro |
+| `high` | High quality | claude-sonnet-4-6, gpt-4o |
+| `mid` | Balanced speed/cost | gpt-4o-mini, llama-3.3-70b, gemini-2.0-flash |
+| `low` | Fast/cheap | gemma-2b, llama-3.2-1b |
+
+When you set a tier as default, synckey resolves it to the best live model at that tier when a request comes in.
+
+---
 
 ## Gateway endpoints
 
@@ -264,47 +365,48 @@ All OpenAI-compatible:
 
 | Endpoint | Notes |
 |---|---|
-| `POST /v1/chat/completions` | Streaming and non-streaming. Optional `provider` hint, `model` optional if a default is set. |
-| `POST /v1/embeddings` | Non-streaming. |
-| `POST /v1/completions` | Legacy completions. |
-| `GET  /v1/requests/{id}` | Poll a deferred request (see below). |
-| `GET  /v1/models` | Aggregated across providers; includes `synckey_tier`. |
-| `GET  /v1/usage` | Live token and cost totals (synckey extension). |
-| `GET  /v1/events?limit=50` | Recent routing events (synckey extension). |
-| `GET  /healthz` | Key counts, provider list, model count. |
+| `POST /v1/chat/completions` | Streaming and non-streaming |
+| `POST /v1/embeddings` | Non-streaming |
+| `POST /v1/completions` | Legacy completions |
+| `GET /v1/requests/{id}` | Poll a deferred request |
+| `GET /v1/models` | Aggregated across providers |
+| `GET /v1/usage` | Token and cost totals |
+| `GET /v1/events?limit=50` | Recent routing events |
+| `GET /healthz` | Key counts, providers, model count |
 
 ---
 
-## Advanced
+## Configuration reference
 
-### Where settings live
+Two stores:
 
-Two stores, by intent:
-
-- **Set via CLI (DB):** global default, per-provider defaults, aliases, tier
-  overrides. These are the things you tune as you go — manage them with
-  `synckey config` and `synckey tier`.
-- **Hand-edited (`~/.synckey/config.toml`):** static infra you version-control.
+- **CLI (DB):** defaults, aliases, tier overrides → `synckey config`, `synckey tier`
+- **File (`~/.synckey/config.toml`):** static infrastructure
 
 ```toml
 [gateway]
-host = "127.0.0.1"   # 0.0.0.0 to expose (put nginx/caddy in front)
+host = "127.0.0.1"   # use 0.0.0.0 and put nginx/caddy in front to expose
 port = 8787
 request_timeout = 120
 
 [routing]
-priority = ["cerebras", "groq", "nvidia"]   # tie-break provider order
-cross_provider_fallback = true
+priority = ["groq", "gemini"]      # provider preference order
+tier_fallback = true                # enable cross-tier fallback
 max_retries = 6
-default_cooldown = 20         # seconds when no Retry-After header
-deep_cooling_threshold = 60   # skip to tier alts when all primary keys cooling > this
+default_cooldown = 20               # seconds when upstream sends no Retry-After
+deep_cooling_threshold = 60        # skip to tier alts after this many seconds cooling
 
 [tiers]
-fallback = true
-overrides = {"my-model" = "frontier"}       # same effect as `synckey tier set`
-prices = {"my-model" = [1.0, 3.0]}          # [input $/M, output $/M]
+overrides = {"my-model" = "frontier"}
+prices = {"my-model" = [1.0, 3.0]}   # [input $/M, output $/M]
 
-# Add any OpenAI-compatible provider not built in:
+[deferred]
+enabled = true
+ttl = 3600           # keep finished responses this long (seconds)
+poll = 5             # worker scan interval
+max_queue = 1000
+
+# Add a custom OpenAI-compatible provider:
 [[providers]]
 id = "fireworks"
 name = "Fireworks AI"
@@ -314,18 +416,15 @@ patterns = ["^accounts/fireworks/"]
 ```
 
 State lives under `~/.synckey/` (override with `$SYNCKEY_HOME`):
-- `secret.key` — Fernet key sealing provider credentials (0600 perms)
-- `synckey.db` — SQLite: keys, usage, events, key states, defaults/aliases
-- `config.toml` — static settings and custom providers
+- `secret.key` Fernet key (0600)
+- `synckey.db` SQLite
+- `config.toml` static settings
 
-> CLI changes to defaults/aliases/tiers apply on the next `synckey serve`.
+---
 
-### Custom domain / reverse proxy
-
-The gateway binds to `127.0.0.1` by default.
+## Expose behind a domain
 
 **nginx:**
-
 ```nginx
 server {
     listen 443 ssl;
@@ -342,90 +441,84 @@ server {
 ```
 
 **Caddy:**
-
 ```caddyfile
 ai.example.com {
     reverse_proxy localhost:8787 {
-        flush_interval -1   # disable buffering for streaming
+        flush_interval -1
     }
 }
 ```
 
 ```bash
-synckey serve --host 0.0.0.0 --port 8787   # or set host in config.toml
+synckey serve --host 0.0.0.0 --port 8787
 ```
 
-### Analytics
+---
+
+## Monitoring
 
 ```bash
-synckey usage                     # lifetime totals
-synckey usage --hours 24          # last 24 hours
-synckey usage --recent            # last 25 requests with status/latency
-synckey spend                     # cost breakdown by model
-synckey events                    # routing events
-synckey events --type key_dead    # filter: rate_limited | key_dead | tier_fallback
+synckey dash              # live TUI dashboard
+synckey status            # at-a-glance overview
+synckey usage             # lifetime totals
+synckey usage --hours 24  # last 24 hours
+synckey usage --recent    # last 25 requests
+synckey spend             # cost breakdown by model
+synckey events            # routing events log
+synckey events --type key_dead    # filter by type
 ```
-
-Via HTTP (unified key required):
-
-```bash
-curl :8787/v1/usage  -H "Authorization: Bearer sk-synckey-..."
-curl :8787/v1/events -H "Authorization: Bearer sk-synckey-..."
-curl :8787/healthz
-```
-
-### Performance
-
-Hot path: key state (cooldowns, buckets) lives entirely in memory — no DB read
-per request; secrets decrypted once and cached; usage rows handed to a background
-writer; responses streamed straight through; async end to end (uvicorn + httpx).
-
-Measured on a single pinned core, 200-way concurrency, 20k requests against a
-local upstream: **~270 req/s, 0 errors, ~83 MB RSS**.
-
-### Security
-
-- Provider secrets are Fernet-encrypted at rest; only the last 4 chars are shown.
-- The unified key is stored as a SHA-256 hash — keep the plaintext from setup safe.
-- The gateway binds to `127.0.0.1` by default. Only expose deliberately.
-- `secret.key` is 0600; `~/.synckey/` is 0700.
 
 ---
 
 ## Full CLI reference
 
 ```
-Getting started
+Setup
   synckey setup                 guided first-run
   synckey init                  mint the unified key only
-  synckey key add <provider>    store credential(s) + fetch models + set default
+  synckey --guide               interactive walkthrough (any time)
+
+Gateway
   synckey serve [--host --port] run the gateway
+  synckey dash [-i N]           live dashboard (1/2/3/4 views, p/r/q)
 
-Configuration
-  synckey config                          show defaults, aliases, settings
-  synckey config set-default <model>      global default model
-  synckey config provider-default <p> <m> per-provider default
-  synckey config alias <name> <target>    define a client-facing alias
-  synckey config unalias <name>           remove an alias
-  synckey tier set <model> <tier>         override a model's tier
-  synckey tier unset <model>              revert to auto-detected tier
-  synckey tier list                       show tier overrides
+Connect
+  synckey test [prov] [model] [N]   test route with N actual calls
+  synckey detect <model>            show routing path (dry-run)
+  synckey routing priority [list]   show/set provider preference order
+  synckey routing preset [name]     reliable | cheap | show current
 
-Keys & models
-  synckey providers                       list supported providers
+Keys
+  synckey key add <provider> [--key|--file|--from-env]
   synckey key list|rm|enable|disable|limits
+  synckey key health
+
+Config
+  synckey config [set-default|provider-default|alias|unalias]
+  synckey tier set|unset|list <model> [tier]
+
+Models
+  synckey providers             list supported providers
   synckey models [--refresh] [-p prov] [--tier ...]
-  synckey detect <model>                  show routing, tier, floor, price
 
 Monitoring
-  synckey dash                            live dashboard (1/2/3, p/r/q)
   synckey usage [--hours N] [--recent]
   synckey spend [--hours N]
   synckey events [--type] [-n limit]
-  synckey deferred list|get               inspect the deferred queue
+  synckey deferred list|get
   synckey status
-  synckey test [provider]                 health-check stored keys
 ```
+
+---
+
+## Security
+
+- Provider secrets are Fernet-encrypted at rest
+- Unified key stored as SHA-256 hash
+- Gateway binds to `127.0.0.1` by default
+- `secret.key` is 0600; `~/.synckey/` is 0700
+
+---
 
 ## Development
 

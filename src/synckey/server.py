@@ -96,6 +96,25 @@ def build_tier_alt_attempts(ctx: Context, resolution: Resolution, body: dict) ->
     return []
 
 
+def _record_routing_chain(ctx: Context, resolution: Resolution, attempt: "Attempt", model: str) -> None:
+    """Record the routing chain for TUI view 4."""
+    chain_parts = []
+    for pid in resolution.providers:
+        prov = ctx.providers.get(pid)
+        if not prov:
+            continue
+        for cand in ctx.pool.candidates(pid):
+            state = "ready" if cand.ready and not cand.cooling else ("cooling" if cand.cooling else "throttled")
+            chain_parts.append(f"{pid}/key#{cand.key_id}({state})")
+    chain_str = " > ".join(chain_parts)
+    ctx.db.record_routing_chain(
+        model=model,
+        provider=attempt.provider_id,
+        key_id=attempt.key_id,
+        chain=chain_str,
+    )
+
+
 def authorized(ctx: Context, request: Request) -> bool:
     expected = ctx.unified_key_hash()
     if not expected:
@@ -342,8 +361,8 @@ async def run_request(
     """Run a resolved request through the key pool.
 
     Returns a Response on success, upstream error, or exhaustion. Returns None
-    only when no key has spare capacity right now — i.e. every usable key is
-    either provider-cooling (429'd) or locally bucket-throttled — and
+    only when no key has spare capacity right now i.e. every usable key is
+    either provider-cooling (429'd) or locally bucket-throttled and
     `defer_when_no_capacity` is set. That None is the caller's signal to queue
     the request for later. When there are no usable keys at all (none configured
     or all dead), a 503 Response is returned instead, since deferring could never
@@ -420,6 +439,7 @@ async def run_request(
                 latency_ms=latency,
                 tier=resolution.tier,
             )
+            _record_routing_chain(ctx, resolution, attempt, body["model"])
             return Response(content=resp.content, media_type="application/json")
 
         retriable, last_err, last_status = classify_failure(
@@ -615,6 +635,7 @@ async def try_stream(
         return None
 
     ctx.pool.on_success(attempt.key_id)
+    _record_routing_chain(ctx, resolution, attempt, body["model"])
 
     async def stream_body() -> AsyncIterator[bytes]:
         prompt = completion = total = 0

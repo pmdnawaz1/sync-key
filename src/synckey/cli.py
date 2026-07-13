@@ -1,33 +1,4 @@
-"""synckey command-line interface.
-
-  Getting started
-    synckey setup                 guided first-run: key, providers, models, defaults
-    synckey init                  one-time setup; prints your unified key
-    synckey key add <provider>    store credential(s): single, comma-bulk, or --file
-    synckey serve                 run the unified gateway
-
-  Configuration
-    synckey config                show defaults, aliases, settings
-    synckey config set-default <model>            global default model
-    synckey config provider-default <prov> <model>  per-provider default
-    synckey config alias <name> <target>          define a client-facing alias
-    synckey tier set <model> <tier>               override a model's quality tier
-
-  Keys & models
-    synckey providers             list every supported provider
-    synckey key list|rm|enable|disable|limits
-    synckey models [--refresh]    discover models your keys can call
-    synckey detect <model>        show routing and tier
-
-  Monitoring
-    synckey dash                  live dashboard (1/2/3 views, p/r/q keys)
-    synckey usage [--recent]      token and cost monitoring
-    synckey spend                 cost breakdown by model
-    synckey events [--type]       routing events log
-    synckey deferred list|get     inspect the deferred request queue
-    synckey status                at-a-glance overview
-    synckey test [provider]       health-check stored keys
-"""
+"""synckey command-line interface."""
 
 from __future__ import annotations
 
@@ -46,7 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from . import __version__
-from .config import ensure_home, generate_unified_key, home
+from .config import ensure_home, generate_unified_key, home, config_path
 from .context import Context
 from .db import sha256
 from .state import Health
@@ -55,15 +26,25 @@ from .tiers import TIER_BY_NAME, TIER_NAMES, model_tier, model_price
 app = typer.Typer(
     name="synckey",
     help="Merge every AI provider key behind one unified, OpenAI-compatible API key.",
-    no_args_is_help=True,
+    no_args_is_help=False,
     add_completion=False,
 )
-key_app = typer.Typer(help="Manage stored provider credentials.", no_args_is_help=True)
-app.add_typer(key_app, name="key")
+
+
+@app.callback(invoke_without_command=True)
+def synckey_main(ctx: typer.Context):
+    """synckey merge every AI provider behind one key."""
+    if ctx.invoked_subcommand is not None:
+        return
+    ctx.command.get_help(ctx)
+
+
 config_app = typer.Typer(help="View and edit routing preferences (defaults, aliases).")
 app.add_typer(config_app, name="config")
 tier_app = typer.Typer(help="Inspect and override model quality tiers.", no_args_is_help=True)
 app.add_typer(tier_app, name="tier")
+routing_app = typer.Typer(help="Routing preferences: provider priority and fallback presets.")
+app.add_typer(routing_app, name="routing")
 
 console = Console()
 err_con = Console(stderr=True)
@@ -281,7 +262,8 @@ def _post_add_flow(ctx, provider: str, fetch_opt: bool | None, default_opt: str 
 
     default = default_opt
     if default is None and interactive:
-        prompt_txt = f"Default model for {provider} (model id / alias / tier, blank to skip)"
+        example = union[0] if union else "llama-3.3-70b"
+        prompt_txt = f"Default model for {provider} (model id like '{example}', or tier: frontier/high/mid/low)"
         default = typer.prompt(prompt_txt, default="", show_default=False).strip() or None
 
     if default:
@@ -295,162 +277,6 @@ def _post_add_flow(ctx, provider: str, fetch_opt: bool | None, default_opt: str 
             ):
                 ctx.prefs.set_global_default(default)
                 console.print(f"[green]Set global default ->[/] [cyan]{default}[/]")
-
-
-@key_app.command("add")
-def key_add(
-    provider: str = typer.Argument(..., help="Provider id, e.g. groq, gemini, cohere."),
-    key: str = typer.Option(None, "--key", "-k", help="Secret key. Comma-separate for bulk."),
-    file: Path = typer.Option(None, "--file", "-f", help="File of keys (per line or comma-separated)."),
-    label: str = typer.Option(None, "--label", "-l"),
-    weight: int = typer.Option(1, "--weight", "-w"),
-    from_env: bool = typer.Option(False, "--from-env", help="Read the key from this provider's env vars."),
-    rpm: float = typer.Option(None, "--rpm", help="Known RPM limit for this key."),
-    tpm: float = typer.Option(None, "--tpm", help="Known TPM limit for this key."),
-    fetch: bool = typer.Option(None, "--fetch/--no-fetch", help="Fetch models after adding (default: ask)."),
-    default: str = typer.Option(None, "--default", help="Set this provider's default model."),
-):
-    """Store credential(s) for a provider.
-
-    Accepts a single key, comma-separated keys (--key "a,b,c"), or a file
-    (--file keys.txt). After adding, offers to fetch the models those keys can
-    call and to set this provider's default model.
-    """
-    ctx = load_ctx()
-    provider = provider.lower()
-    if provider not in ctx.providers:
-        err_con.print(f"[red]Unknown provider '{provider}'.[/] Run `synckey providers`.")
-        raise typer.Exit(1)
-
-    secrets = _collect_secrets(ctx, provider, key, file, from_env)
-    for i, s in enumerate(secrets):
-        lbl = label if len(secrets) == 1 else (f"{label}-{i+1}" if label else None)
-        _add_one_key(ctx, provider, s, lbl, weight, rpm, tpm)
-    if len(secrets) > 1:
-        console.print(f"[green]Added {len(secrets)} key(s) for {ctx.providers[provider].name}.[/]")
-
-    _post_add_flow(ctx, provider, fetch, default)
-    ctx.close()
-
-
-@key_app.command("import", hidden=True)
-def key_import(
-    provider: str = typer.Argument(..., help="Provider id, e.g. groq, gemini."),
-    file: Path = typer.Option(None, "--file", "-f", help="File with keys (per line or comma-separated)."),
-    keys: str = typer.Option(None, "--keys", "-k", help="Comma-separated keys."),
-    from_env: bool = typer.Option(False, "--from-env", help="Import all matching env vars."),
-    weight: int = typer.Option(1, "--weight", "-w"),
-    rpm: float = typer.Option(None, "--rpm"),
-    tpm: float = typer.Option(None, "--tpm"),
-):
-    """Deprecated alias for `synckey key add` (which now handles --file and bulk)."""
-    ctx = load_ctx()
-    provider = provider.lower()
-    if provider not in ctx.providers:
-        err_con.print(f"[red]Unknown provider '{provider}'.[/] Run `synckey providers`.")
-        raise typer.Exit(1)
-    secrets = _collect_secrets(ctx, provider, keys, file, from_env)
-    for s in secrets:
-        _add_one_key(ctx, provider, s, None, weight, rpm, tpm)
-    console.print(
-        f"[green]Imported {len(secrets)} key(s) for {ctx.providers[provider].name}.[/] "
-        "[dim](tip: `synckey key add` now does this directly)[/]"
-    )
-    ctx.close()
-
-
-@key_app.command("list")
-def key_list(provider: str = typer.Argument(None)):
-    """Key health matrix: live/cooling/dead, burn rate, request counts."""
-    ctx = load_ctx()
-    keys = ctx.db.list_keys(provider=provider.lower() if provider else None)
-    if not keys:
-        console.print("[yellow]No keys stored.[/] Add one: `synckey key add <provider>`")
-        ctx.close()
-        return
-    states = ctx.states.all()
-    stats = ctx.db.key_stats()
-
-    table = Table(title="Key health matrix")
-    for col in ("id", "provider", "label", "weight", "health", "rpm cap", "rpm used", "requests", "errors", "cost"):
-        table.add_column(col, no_wrap=True)
-
-    for k in keys:
-        st = states.get(k.id)
-        from .state import KeyState
-        ks = st if st else KeyState()
-        bucket = ctx.pool._buckets.get(k.id) if k.id in ctx.pool._buckets._buckets else None
-
-        remaining = ks.cooldown_remaining()
-        ht = health_text(ks.health, remaining)
-
-        rpm_cap = k.rpm_limit or (ks.rpm_observed if ks.rpm_observed else None)
-        rpm_cap_str = f"{rpm_cap:.0f}" if rpm_cap else "unknown"
-        rpm_used = f"{bucket.emission_rpm():.1f}" if bucket else "0.0"
-
-        s = stats.get(k.id, {})
-        table.add_row(
-            str(k.id),
-            k.provider,
-            k.label,
-            str(k.weight),
-            ht,
-            rpm_cap_str,
-            rpm_used,
-            str(s.get("requests", 0)),
-            str(s.get("errors", 0)),
-            fmt_cost(s.get("cost")),
-        )
-    console.print(table)
-    if any(states.get(k.id, None) and states[k.id].dead_reason for k in keys):
-        console.print("[dim]Dead key reasons:[/]")
-        for k in keys:
-            if k.id in states and states[k.id].health == Health.DEAD:
-                console.print(f"  [red]#{k.id}[/] {states[k.id].dead_reason}")
-    ctx.close()
-
-
-@key_app.command("rm")
-def key_remove(key_id: int = typer.Argument(...)):
-    """Remove a stored credential."""
-    ctx = load_ctx()
-    if ctx.db.remove_key(key_id):
-        console.print(f"[green]Removed[/] key #{key_id}.")
-    else:
-        err_con.print(f"[red]No key #{key_id}.[/]")
-    ctx.close()
-
-
-@key_app.command("enable")
-def key_enable(key_id: int = typer.Argument(...)):
-    """Re-enable a dead or disabled key."""
-    ctx = load_ctx()
-    ctx.db.set_key_enabled(key_id, True)
-    ctx.states.set_live(key_id)
-    console.print(f"[green]Enabled[/] key #{key_id}.")
-    ctx.close()
-
-
-@key_app.command("disable")
-def key_disable(key_id: int = typer.Argument(...)):
-    """Disable a key without deleting it."""
-    ctx = load_ctx()
-    ctx.db.set_key_enabled(key_id, False)
-    console.print(f"[yellow]Disabled[/] key #{key_id}.")
-    ctx.close()
-
-
-@key_app.command("limits")
-def key_limits(
-    key_id: int = typer.Argument(...),
-    rpm: float = typer.Option(None, "--rpm"),
-    tpm: float = typer.Option(None, "--tpm"),
-):
-    """Set or update RPM/TPM limits for a key (drives the proactive bucket)."""
-    ctx = load_ctx()
-    ctx.db.set_key_limits(key_id, rpm, tpm)
-    console.print(f"[green]Updated[/] key #{key_id}: RPM={rpm or '(unchanged)'} TPM={tpm or '(unchanged)'}")
-    ctx.close()
 
 
 @app.command()
@@ -494,35 +320,6 @@ def models(
         table.add_row(model, pid, f"[{color}]{tier_name}[/]" if color else tier_name)
     console.print(table)
     console.print(f"[dim]Index age: {int(ctx.router.index_age())}s. Use --refresh to update.[/]")
-    ctx.close()
-
-
-@app.command()
-def detect(model: str = typer.Argument(...)):
-    """Show routing, tier, and floor for a model name."""
-    ctx = load_ctx()
-    res = ctx.router.resolve(model)
-    tier = model_tier(model)
-    price = model_price(model)
-    if not res.providers:
-        console.print(
-            f"[yellow]'{model}' is unroutable.[/] No prefix, index entry, or pattern matched."
-        )
-    else:
-        price_str = f"${price[0]:.2f}/${price[1]:.2f} per M tokens" if price else "unknown"
-        console.print(
-            Panel.fit(
-                f"model:     [cyan]{model}[/]\n"
-                f"upstream:  [cyan]{res.bare_model}[/]\n"
-                f"routed by: [bold]{res.how}[/]\n"
-                f"tier:      [bold]{TIER_NAMES.get(tier or 0, 'unknown')}[/] ({tier})\n"
-                f"floor:     {TIER_NAMES.get(res.floor or 0, 'none')} (fallback stays >= this)\n"
-                f"providers: {' > '.join(res.providers)}\n"
-                f"price:     {price_str}",
-                title="Routing",
-                border_style="cyan",
-            )
-        )
     ctx.close()
 
 
@@ -580,7 +377,7 @@ def config_main(ctx_: typer.Context):
 
 
 @config_app.command("set-default")
-def config_set_default(model: str = typer.Argument(..., help="Model id, alias, or tier.")):
+def config_set_default(model: str = typer.Argument(..., help="Model id (e.g. gpt-4o), a tier (frontier/high/mid/low), or an alias.")):
     """Set the global default model (used when a request names no model)."""
     ctx = load_ctx()
     ctx.prefs.set_global_default(model)
@@ -591,7 +388,7 @@ def config_set_default(model: str = typer.Argument(..., help="Model id, alias, o
 @config_app.command("provider-default")
 def config_provider_default(
     provider: str = typer.Argument(..., help="Provider id, e.g. groq."),
-    model: str = typer.Argument(..., help="Model id, alias, or tier."),
+    model: str = typer.Argument(..., help="Model id (e.g. llama-3.3-70b), a tier (frontier/high/mid/low), or an alias."),
 ):
     """Set a provider's default model (used when a request names only that provider)."""
     ctx = load_ctx()
@@ -671,9 +468,83 @@ def tier_list():
     ctx.close()
 
 
+@app.command("keys")
+def keys(
+    provider: str = typer.Argument(None),
+    rm: int = typer.Option(None, "--rm", help="Remove a key by its id."),
+    enable: int = typer.Option(None, "--enable", help="Re-enable a dead or disabled key."),
+    disable: int = typer.Option(None, "--disable", help="Disable a key without deleting it."),
+):
+    """List all stored keys, or manage them with flags.
+
+    Examples:
+      synckey keys              list all keys
+      synckey keys --rm 3       remove key #3
+      synckey keys --enable 3   re-enable key #3
+      synckey keys --disable 3  disable key #3
+    """
+    ctx = load_ctx()
+
+    if rm is not None:
+        if ctx.db.remove_key(rm):
+            console.print(f"[green]Removed[/] key #{rm}.")
+        else:
+            err_con.print(f"[red]No key #{rm}.[/]")
+        ctx.close()
+        return
+
+    if enable is not None:
+        ctx.db.set_key_enabled(enable, True)
+        ctx.states.set_live(enable)
+        console.print(f"[green]Enabled[/] key #{enable}.")
+        ctx.close()
+        return
+
+    if disable is not None:
+        ctx.db.set_key_enabled(disable, False)
+        console.print(f"[yellow]Disabled[/] key #{disable}.")
+        ctx.close()
+        return
+
+    keys = ctx.db.list_keys(provider=provider.lower() if provider else None)
+    if not keys:
+        console.print("[yellow]No keys stored.[/] Run `synckey key add <provider>` to add one.")
+        ctx.close()
+        return
+
+    states = ctx.states.all()
+    stats = ctx.db.key_stats()
+
+    table = Table(title="Keys  (remove: synckey keys --rm <id>)")
+    table.add_column("id", style="cyan", no_wrap=True)
+    table.add_column("provider")
+    table.add_column("health")
+    table.add_column("requests", justify="right")
+    table.add_column("errors", justify="right")
+    table.add_column("cost", justify="right")
+
+    for k in keys:
+        st = states.get(k.id)
+        from .state import KeyState
+        ks = st if st else KeyState()
+        ht = health_text(ks.health, ks.cooldown_remaining())
+        s = stats.get(k.id, {})
+        table.add_row(
+            str(k.id),
+            k.provider,
+            ht,
+            str(s.get("requests", 0)),
+            str(s.get("errors", 0)),
+            fmt_cost(s.get("cost")),
+        )
+
+    console.print(table)
+    ctx.close()
+
+
 @app.command()
 def setup():
-    """Guided first-run: mint your key, add providers, fetch models, set defaults."""
+    """Add or update provider API keys (interactive guided setup)."""
     ensure_home()
     ctx = Context()
 
@@ -694,9 +565,24 @@ def setup():
         console.print("[dim]Already initialized — keeping your existing unified key.[/]")
 
     # 2. Add providers
-    console.print("\n[bold]Add provider keys.[/] Enter a provider id (e.g. groq, gemini) or blank to finish.")
+    console.print("\n[bold]Add provider keys.[/]")
+    added_any = False
     while True:
-        provider = typer.prompt("Provider", default="", show_default=False).strip().lower()
+        if added_any:
+            prompt = "Add another provider and keys?"
+        else:
+            prompt = "Add a provider and keys?"
+        add_more = (
+            typer.confirm(prompt, default=False)
+            if sys.stdin.isatty()
+            else False
+        )
+        if not add_more:
+            break
+        provider = typer.prompt(
+            "Provider id (e.g. groq, gemini, openai)",
+            default="", show_default=False,
+        ).strip().lower()
         if not provider:
             break
         if provider not in ctx.providers:
@@ -706,12 +592,11 @@ def setup():
         for s in secrets:
             _add_one_key(ctx, provider, s, None, 1, None, None)
         _post_add_flow(ctx, provider, None, None)
+        added_any = True
         console.print()
-
-    # 3. Global default
     if not ctx.prefs.global_default():
         pick = typer.prompt(
-            "Global default model (model id / alias / tier, blank to skip)",
+            "Global default model (model id like 'gpt-4o', or a tier: frontier/high/mid/low, or an alias)",
             default="", show_default=False,
         ).strip()
         if pick:
@@ -720,18 +605,178 @@ def setup():
 
     # 4. Summary
     configured = ctx.db.providers_with_keys()
+    first_provider = configured[0] if configured else None
+    default_model = ctx.prefs.global_default() or "llama-3.3-70b-versatile"
+
+    curl_examples = ""
+    if first_provider:
+        curl_examples = (
+            f"\n"
+            f"[bold]Try it:[/]\n"
+            f"  curl http://localhost:8080/v1/chat/completions \\\n"
+            f"    -H 'Authorization: Bearer YOUR_SYNCKEY_KEY' \\\n"
+            f"    -H 'Content-Type: application/json' \\\n"
+            f"    -d '{{\"model\": \"{default_model}\", \"messages\": [{{\"role\": \"user\", \"content\": \"Hi\"}}]}}'\n\n"
+            f"[bold]With a specific provider:[/]\n"
+            f"  curl http://localhost:8080/v1/chat/completions \\\n"
+            f"    -H 'Authorization: Bearer YOUR_SYNCKEY_KEY' \\\n"
+            f"    -H 'Content-Type: application/json' \\\n"
+            f"    -d '{{\"model\": \"{first_provider}/{default_model}\", \"messages\": [{{\"role\": \"user\", \"content\": \"Hi\"}}]}}'\n"
+        )
+
     console.print(
         Panel.fit(
             f"providers:      {', '.join(configured) or '(none)'}\n"
             f"models indexed: {len(ctx.router.index)}\n"
-            f"global default: {ctx.prefs.global_default() or '(none)'}\n\n"
+            f"global default: {default_model}\n\n"
             f"Start the gateway:  [bold]synckey serve[/]\n"
             f"Health-check keys:  [bold]synckey test[/]\n"
-            f"Watch it live:      [bold]synckey dash[/]",
+            f"Watch it live:      [bold]synckey dash[/]"
+            f"{curl_examples}",
             title="Setup complete",
             border_style="green",
         )
     )
+    ctx.close()
+
+
+@app.command()
+def guide():
+    """Interactive walkthrough of synckey concepts (any time, not just first run)."""
+    console.print(Panel.fit(
+        "[bold]synckey guide[/] let's walk through how it all works.\n"
+        "Press Enter at each step, or Ctrl+C to quit anytime.",
+        border_style="cyan",
+    ))
+    time.sleep(0.5)
+
+    console.print("\n[bold cyan]1. The unified key[/]")
+    console.print("   synckey gives you ONE key that works with ALL providers.")
+    console.print("   Your app uses this key synckey routes to the right provider.")
+    input("\n   Press Enter to continue...")
+
+    console.print("\n[bold cyan]2. How routing works[/]")
+    console.print("   Send a model name → synckey finds which provider has it.")
+    console.print("   Send 'provider/model' → forces that provider.")
+    console.print("   Send nothing → uses your global default model.")
+    console.print("   Send only provider → uses that provider's default model.")
+    input("\n   Press Enter to continue...")
+
+    console.print("\n[bold cyan]3. The fallback chain[/]")
+    console.print("   Every model has a quality tier: FRONTIER > HIGH > MID > LOW")
+    console.print("   If your first choice is rate-limited, synckey finds another at")
+    console.print("   the SAME tier (never drops to a cheaper tier).")
+    console.print("   Override per request: -H 'X-Quality-Floor: high'")
+    input("\n   Press Enter to continue...")
+
+    console.print("\n[bold cyan]4. When all keys are cooling[/]")
+    console.print("   Instead of failing, synckey QUEUES your request and gives you")
+    console.print("   a poll URL. It runs automatically when a key frees up.")
+    console.print("   GET /v1/requests/<id> to check the result.")
+    input("\n   Press Enter to continue...")
+
+    console.print("\n[bold cyan]5. Routing presets[/]")
+    ctx = load_ctx()
+    preset = "custom"
+    if ctx.settings.tier_fallback_enabled and ctx.settings.deep_cooling_threshold == 60.0:
+        preset = "reliable"
+    elif not ctx.settings.tier_fallback_enabled:
+        preset = "cheap"
+    console.print(f"   Current preset: [cyan]{preset}[/]")
+    console.print("   reliable = tier fallback on, deep_cooling_threshold=60s")
+    console.print("   cheap    = tier fallback off (prefer cost over quality)")
+    console.print("   Run `synckey routing preset reliable` or `synckey routing preset cheap`")
+    ctx.close()
+    input("\n   Press Enter to continue...")
+
+    console.print("\n[bold cyan]6. Try it[/]")
+    console.print("   synckey serve          start the gateway")
+    console.print("   synckey dash           live dashboard")
+    console.print("   synckey test groq llama-3.3-70b-versatile 5  test a route with 5 calls")
+    console.print("   synckey models        see which models are available")
+    console.print("")
+    console.print(Panel.fit(
+        "[bold green]That's it![/] Run `synckey --help` anytime for the full command reference.",
+        border_style="green",
+    ))
+
+
+@routing_app.command("priority")
+def routing_priority(
+    providers: str = typer.Argument(None, help="Space-separated provider list, e.g. groq gemini."),
+):
+    """Show or set provider priority order (first = preferred when multiple have the model)."""
+    ctx = load_ctx()
+    if providers:
+        plist = [p.strip().lower() for p in providers.split() if p.strip()]
+        for p in plist:
+            if p not in ctx.providers:
+                err_con.print(f"[red]Unknown provider:[/] {p}")
+                err_con.print(f"[dim]Run `synckey providers` for the list.[/]")
+                ctx.close()
+                raise typer.Exit(1)
+        ctx.settings.provider_priority = plist
+        ctx.settings.save()
+        console.print(f"[green]Priority ->[/] {' > '.join(plist)}")
+    else:
+        current = ctx.settings.provider_priority
+        all_providers = sorted(ctx.providers.keys())
+        if current:
+            console.print(f"[cyan]Current priority:[/] {' > '.join(current)}")
+        else:
+            console.print("[dim]No priority set (uses provider order from config or default).[/]")
+        console.print(f"[dim]All providers:[/] {', '.join(all_providers)}")
+    ctx.close()
+
+
+@routing_app.command("preset")
+def routing_preset(
+    name: str = typer.Argument(None, help="reliable | cheap | (empty to show current)"),
+):
+    """Set or show the routing fallback preset.
+
+    reliable: tier fallback ON, deep_cooling_threshold=60s
+              Never drops below the requested model's tier.
+              Jumps to same-tier alternative after 60s of cooling.
+
+    cheap:   tier fallback OFF
+              Uses whatever key is available, regardless of tier.
+              Can fall from FRONTIER to LOW if that's what's cheap/available.
+    """
+    ctx = load_ctx()
+    if name is None:
+        tfe = ctx.settings.tier_fallback_enabled
+        dct = ctx.settings.deep_cooling_threshold
+        if tfe and dct == 60.0:
+            console.print(f"[cyan]Current preset:[/] [green]reliable[/]")
+            console.print("  tier_fallback: on")
+            console.print("  deep_cooling_threshold: 60s")
+        elif not tfe:
+            console.print(f"[cyan]Current preset:[/] [yellow]cheap[/]")
+            console.print("  tier_fallback: off")
+            console.print("  deep_cooling_threshold: 60s")
+        else:
+            console.print(f"[cyan]Current preset:[/] [dim]custom[/]")
+            console.print(f"  tier_fallback: {tfe}")
+            console.print(f"  deep_cooling_threshold: {dct}s")
+        console.print("\n[dim]Set: synckey routing preset reliable | cheap[/]")
+        ctx.close()
+        return
+
+    name = name.lower().strip()
+    if name not in ("reliable", "cheap"):
+        err_con.print("[red]Preset must be:[/] reliable | cheap")
+        raise typer.Exit(1)
+
+    if name == "reliable":
+        ctx.settings.tier_fallback_enabled = True
+        ctx.settings.deep_cooling_threshold = 60.0
+    else:  # cheap
+        ctx.settings.tier_fallback_enabled = False
+        ctx.settings.deep_cooling_threshold = 60.0
+
+    ctx.settings.save()
+    console.print(f"[green]Preset set to:[/] [bold]{name}[/]")
     ctx.close()
 
 
@@ -768,12 +813,13 @@ def serve(
             f"providers:        {', '.join(ctx.db.providers_with_keys()) or '(none)'}\n"
             f"models indexed:   {len(ctx.router.index)}\n"
             f"keys live/dead:   {live}/{dead}\n"
-            f"default model:    {ctx.prefs.global_default() or '(none — clients must send model)'}\n"
+            f"default model:    {ctx.prefs.global_default() or '(none clients must send model)'}\n"
             f"max_retries:      {ctx.settings.max_retries}\n"
             f"tier fallback:    {'on' if ctx.settings.tier_fallback_enabled else 'off'}\n"
             f"deferred queue:   {'on' if ctx.settings.deferred_enabled else 'off'}"
             f" (202 + poll when all keys cooling; TTL {int(ctx.settings.deferred_ttl)}s)\n"
-            f"quality floor:    per-request via X-Quality-Floor header",
+            f"quality floor:    per-request via X-Quality-Floor header\n\n"
+            f"[dim]Stop:[/] Ctrl+C",
             border_style="green",
         )
     )
@@ -1006,11 +1052,28 @@ def status():
 
 
 @app.command()
-def test(provider: str = typer.Argument(None)):
-    """Health-check stored keys by hitting each provider's models endpoint."""
+def test(
+    provider: str = typer.Argument(None, help="Provider id (omit to health-check all)."),
+    model: str = typer.Argument(None, help="Model id (with provider: makes actual test calls)."),
+    calls: int = typer.Argument(1, help="Number of test calls to make."),
+):
+    """Health-check stored keys, or test a route with actual calls.
+
+    Without model: hits each provider's /models endpoint (health check).
+
+    With provider + model: makes `calls` actual API calls to that provider/model
+    and shows per-call routing, latency, tokens, and status.
+    """
     import httpx
 
     ctx = load_ctx()
+
+    if model:
+        _run_test_calls(ctx, provider, model, calls)
+        ctx.close()
+        return
+
+    # Health-check mode (original behavior)
     targets = [provider.lower()] if provider else ctx.db.providers_with_keys()
     if not targets:
         console.print("[yellow]No providers to test.[/]")
@@ -1033,7 +1096,11 @@ def test(provider: str = typer.Argument(None)):
             from .state import KeyState
             ks = st if st else KeyState()
             cur = health_text(ks.health, ks.cooldown_remaining())
-            secret = ctx.box.open(k.secret)
+            try:
+                secret = ctx.box.open(k.secret)
+            except RuntimeError:
+                table.add_row(pid, f"#{k.id} {k.label}", cur, "[red]key corrupt re-add with synckey key add[/]")
+                continue
             try:
                 resp = httpx.get(
                     url,
@@ -1057,11 +1124,99 @@ def test(provider: str = typer.Argument(None)):
     ctx.close()
 
 
+async def _call_model(ctx, provider, model, k, secret):
+    """Make a single test call; returns (status_code, latency_ms, tokens, error, chain)."""
+    import httpx
+    prov = ctx.providers.get(provider)
+    if not prov:
+        return 0, 0, 0, f"unknown provider {provider}", ""
+
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "say hi in one word"}],
+        "max_tokens": 10,
+    }
+    chain_parts = [f"{provider}/key#{k.id}"]
+    try:
+        url = prov.base_url.rstrip("/") + "/chat/completions"
+        t0 = time.time()
+        resp = httpx.AsyncClient(timeout=30.0).post(
+            url,
+            headers={**prov.auth_headers(secret), "Content-Type": "application/json"},
+            json=body,
+        )
+        resp = await resp
+        latency = int((time.time() - t0) * 1000)
+        if resp.status_code == 200:
+            data = resp.json()
+            tokens = (data.get("usage") or {}).get("total_tokens", 0)
+            return resp.status_code, latency, tokens, None, " > ".join(chain_parts)
+        else:
+            err_msg = f"HTTP {resp.status_code}"
+            try:
+                err_msg = resp.json().get("error", {}).get("message", err_msg)
+            except Exception:
+                pass
+            return resp.status_code, latency, 0, err_msg, " > ".join(chain_parts)
+    except Exception as exc:
+        return 0, 0, 0, str(exc), " > ".join(chain_parts)
+
+
+def _run_test_calls(ctx, provider, model, calls):
+    """Run `calls` actual test calls to the given provider/model."""
+    if provider.lower() not in ctx.providers:
+        err_con.print(f"[red]Unknown provider:[/] {provider}")
+        err_con.print(f"[dim]Run `synckey providers` for the list.[/]")
+        return
+
+    keys = ctx.db.list_keys(provider=provider.lower(), enabled_only=True)
+    if not keys:
+        err_con.print(f"[red]No enabled keys for[/] {provider}.")
+        err_con.print(f"[dim]Run `synckey key add {provider}` first.[/]")
+        return
+
+    console.print(f"[cyan]Testing[/] {provider}/{model} {calls} call(s) with {len(keys)} key(s)\n")
+
+    table = Table(title=f"Route test: {provider}/{model}")
+    table.add_column("#", justify="right")
+    table.add_column("key")
+    table.add_column("provider", style="cyan")
+    table.add_column("model")
+    table.add_column("status", style="bold")
+    table.add_column("ms", justify="right")
+    table.add_column("tokens", justify="right")
+    table.add_column("error / chain")
+
+    import asyncio
+    results = []
+    for i in range(calls):
+        for k in keys:
+            try:
+                secret = ctx.box.open(k.secret)
+            except RuntimeError:
+                err_con.print(f"[red]Key #{k.id} is corrupt (secret.key may have changed).[/]")
+                err_con.print(f"[dim]Re-add it: synckey key add {provider}[/]")
+                continue
+            status, latency, tokens, error, chain = asyncio.run(
+                _call_model(ctx, provider.lower(), model, k, secret)
+            )
+            results.append((i + 1, k, provider, model, status, latency, tokens, error, chain))
+
+    for i, k, prov, mod, status, latency, tokens, error, chain in results:
+        status_str = f"[green]{status}[/]" if status == 200 else f"[red]{status}[/]"
+        err_str = f"[red]{error}[/]" if error else chain
+        table.add_row(
+            str(i), f"#{k.id}", prov, mod,
+            status_str, str(latency), str(tokens) if tokens else "—", err_str,
+        )
+    console.print(table)
+
+
 def _read_key(timeout: float) -> str | None:
     """Poll for a single keypress for up to `timeout` seconds. Windows: msvcrt.
 
     Returns the lowercased character, or None if nothing was pressed (or the
-    platform has no non-blocking console read — then it just sleeps).
+    platform has no non-blocking console read then it just sleeps).
     """
     try:
         import msvcrt  # Windows only
@@ -1084,7 +1239,7 @@ def _read_key(timeout: float) -> str | None:
 def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh interval (seconds).")):
     """Live dashboard with keyboard navigation.
 
-    Keys: [1] overview  [2] keys  [3] events  [p] pause  [r] refresh  [q] quit.
+    Keys: [1] overview  [2] keys  [3] events  [4] routing  [p] pause  [r] refresh  [q] quit.
     """
     from .state import Health as H, KeyState
 
@@ -1111,7 +1266,7 @@ def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh i
     def _legend() -> Panel:
         hint = (
             "[bold]1[/] overview   [bold]2[/] keys   [bold]3[/] events   "
-            "[bold]p[/] pause   [bold]r[/] refresh   [bold]q[/] quit"
+            "[bold]4[/] routing   [bold]p[/] pause   [bold]r[/] refresh   [bold]q[/] quit"
             if interactive
             else "Ctrl+C to exit  ·  (interactive keys unavailable in this terminal)"
         )
@@ -1167,6 +1322,31 @@ def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh i
             )
         return Panel(t, title="Recent requests")
 
+    def _routing_panel() -> Panel:
+        chains = ctx.db.recent_routing_chains(15)
+        if not chains:
+            return Panel(
+                "[dim]No routing chain data yet.\n"
+                "Send requests through the gateway to see the routing path here.\n"
+                "Or run: synckey test groq llama-3.3-70b-versatile 5[/]",
+                title="Routing chain",
+                border_style="cyan",
+            )
+        t = Table(show_header=True, header_style="bold", expand=True, box=None)
+        for col in ("when", "model", "provider", "key", "chain"):
+            t.add_column(col)
+        for r in chains:
+            ago = int(time.time() - r["ts"])
+            chain_text = r["chain"] or ""
+            t.add_row(
+                f"{ago}s",
+                r["model"] or "",
+                r["provider"] or "",
+                f"#{r['key_id']}" if r["key_id"] else "",
+                chain_text[:80] + ("…" if len(chain_text) > 80 else ""),
+            )
+        return Panel(t, title="Routing chain (recent)")
+
     def _build(view: str, paused: bool) -> Layout:
         layout = Layout()
         layout.split_column(
@@ -1183,6 +1363,8 @@ def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh i
             )
         elif view == "events":
             layout["body"].update(_events_panel())
+        elif view == "routing":
+            layout["body"].update(_routing_panel())
         else:  # overview
             layout["body"].split_column(Layout(name="top"), Layout(name="bottom", size=9))
             layout["body"]["top"].split_row(
@@ -1194,7 +1376,7 @@ def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh i
 
     view = "overview"
     paused = False
-    views = {"1": "overview", "2": "keys", "3": "events"}
+    views = {"1": "overview", "2": "keys", "3": "events", "4": "routing"}
     last = 0.0
     try:
         with Live(_build(view, paused), refresh_per_second=4, screen=True) as live:

@@ -94,9 +94,46 @@ class Settings:
             deferred_enabled=deferred.get("enabled", True),
             deferred_ttl=deferred.get("ttl", cls.deferred_ttl),
             deferred_poll=deferred.get("poll", cls.deferred_poll),
-            deferred_max_queue=deferred.get("max_queue", cls.deferred_max_queue),
-            deferred_max_queue_age=deferred.get("max_queue_age", cls.deferred_max_queue_age),
-        )
+              deferred_max_queue=deferred.get("max_queue", cls.deferred_max_queue),
+              deferred_max_queue_age=deferred.get("max_queue_age", cls.deferred_max_queue_age),
+          )
+
+    def save(self) -> None:
+        """Write current settings back to config.toml."""
+        import tomllib
+
+        path = config_path()
+        data = {}
+        if path.exists():
+            try:
+                data = tomllib.loads(path.read_text())
+            except Exception:
+                pass
+        data.setdefault("gateway", {})["host"] = self.host
+        data.setdefault("gateway", {})["port"] = self.port
+        data.setdefault("gateway", {})["request_timeout"] = self.request_timeout
+        data.setdefault("gateway", {})["max_connections"] = self.max_connections
+        data.setdefault("gateway", {})["max_keepalive"] = self.max_keepalive
+        data.setdefault("routing", {})["priority"] = self.provider_priority
+        data.setdefault("routing", {})["cross_provider_fallback"] = self.cross_provider_fallback
+        data.setdefault("routing", {})["max_retries"] = self.max_retries
+        data.setdefault("routing", {})["default_cooldown"] = self.default_cooldown
+        data.setdefault("routing", {})["tier_fallback"] = self.tier_fallback_enabled
+        data.setdefault("routing", {})["deep_cooling_threshold"] = self.deep_cooling_threshold
+        data.setdefault("tiers", {})["overrides"] = self.tier_overrides
+        data.setdefault("tiers", {})["prices"] = self.price_overrides
+        data["providers"] = self.custom_providers
+        data.setdefault("deferred", {})["enabled"] = self.deferred_enabled
+        data.setdefault("deferred", {})["ttl"] = self.deferred_ttl
+        data.setdefault("deferred", {})["poll"] = self.deferred_poll
+        data.setdefault("deferred", {})["max_queue"] = self.deferred_max_queue
+        data.setdefault("deferred", {})["max_queue_age"] = self.deferred_max_queue_age
+
+        try:
+            import tomli
+        except ImportError:
+            import toml as tomli
+        path.write_text(tomli.dumps(data))
 
 
 def ensure_home() -> Path:

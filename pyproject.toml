@@ -1,7 +1,7 @@
 [project]
 name = "synckey"
 version = "0.1.0"
-description = "Merge every AI provider key behind one unified, OpenAI-compatible API key. Round-robin, rate-limit eating, token monitoring, provider auto-detection — all from the CLI."
+description = "Merge every AI provider key behind one unified, OpenAI-compatible API key. Round-robin, rate-limit eating, token monitoring, provider auto-detection all from the CLI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

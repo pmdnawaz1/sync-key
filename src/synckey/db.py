@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS events (
     fallback_to TEXT,
     tier_from   INTEGER,
     tier_to     INTEGER,
+    chain       TEXT,
     message     TEXT
 );
 
@@ -79,6 +80,15 @@ CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_keys_provider ON keys(provider);
 CREATE INDEX IF NOT EXISTS idx_deferred_status ON deferred(status);
+
+CREATE TABLE IF NOT EXISTS routing_chains (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         REAL    NOT NULL,
+    model      TEXT    NOT NULL,
+    provider   TEXT    NOT NULL,
+    key_id     INTEGER,
+    chain      TEXT    NOT NULL
+);
 """
 
 USAGE_COLS = (
@@ -245,12 +255,28 @@ class Database:
         fallback_to: str | None = None,
         tier_from: int | None = None,
         tier_to: int | None = None,
+        chain: str | None = None,
         message: str | None = None,
     ) -> None:
         self.conn.execute(
-            "INSERT INTO events(ts,type,key_id,provider,model,fallback_to,tier_from,tier_to,message) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (time.time(), type, key_id, provider, model, fallback_to, tier_from, tier_to, message),
+            "INSERT INTO events(ts,type,key_id,provider,model,fallback_to,tier_from,tier_to,chain,message) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), type, key_id, provider, model, fallback_to, tier_from, tier_to, chain, message),
+        )
+        self.conn.commit()
+
+    def record_routing_chain(
+        self,
+        *,
+        model: str,
+        provider: str,
+        key_id: int,
+        chain: str,
+    ) -> None:
+        """Record the full routing chain for a request for TUI view 4."""
+        self.conn.execute(
+            "INSERT INTO routing_chains(ts, model, provider, key_id, chain) VALUES(?,?,?,?,?)",
+            (time.time(), model, provider, key_id, chain),
         )
         self.conn.commit()
 
@@ -262,6 +288,17 @@ class Database:
         return self.conn.execute(
             "SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def recent_routing_chains(self, limit: int = 20) -> list[sqlite3.Row]:
+        """Return the most recent routing chains for TUI view 4."""
+        return self.conn.execute(
+            "SELECT * FROM routing_chains ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def routing_chain_by_id(self, chain_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM routing_chains WHERE id=?", (chain_id,)
+        ).fetchone()
 
     # usage reads
     def usage_summary(self, since: float | None = None) -> list[sqlite3.Row]:
