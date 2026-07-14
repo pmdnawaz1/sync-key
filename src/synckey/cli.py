@@ -32,8 +32,11 @@ app = typer.Typer(
 
 
 @app.callback(invoke_without_command=True)
-def synckey_main(ctx: typer.Context):
+def synckey_main(ctx: typer.Context, guide: bool = typer.Option(False, "--guide", help="Interactive walkthrough of synckey concepts.")):
     """synckey merge every AI provider behind one key."""
+    if guide:
+        _run_guide()
+        raise typer.Exit(0)
     if ctx.invoked_subcommand is not None:
         return
     ctx.command.get_help(ctx)
@@ -78,38 +81,6 @@ def health_text(h: Health, remaining: float = 0) -> Text:
     if h == Health.COOLING:
         return Text(f"COOLING {int(remaining)}s", style="yellow")
     return Text("LIVE", style="green")
-
-
-@app.command()
-def init(force: bool = typer.Option(False, "--force", help="Regenerate the unified key.")):
-    """Initialize synckey and mint your unified API key."""
-    ensure_home()
-    ctx = Context()
-    if ctx.unified_key_hash() and not force:
-        err_con.print("[yellow]Already initialized.[/] Use --force to mint a new key.")
-        console.print(f"Config home: [cyan]{home()}[/]")
-        raise typer.Exit(0)
-
-    unified = generate_unified_key()
-    ctx.db.set_meta("unified_key_hash", sha256(unified))
-    ctx.db.set_meta("created_at", str(time.time()))
-    _ = ctx.box
-
-    console.print(
-        Panel.fit(
-            f"[bold green]synckey is ready[/]\n\n"
-            f"Your unified API key (shown once, store it now):\n\n"
-            f"  [bold cyan]{unified}[/]\n\n"
-            f"Point any OpenAI-compatible client at the gateway:\n"
-            f"  base_url = http://{ctx.settings.host}:{ctx.settings.port}/v1\n"
-            f"  api_key  = the key above\n\n"
-            f"Next: [bold]synckey key add groq[/]  then  [bold]synckey serve[/]\n"
-            f"Or run the guided flow: [bold]synckey setup[/]",
-            title="Unified Key",
-            border_style="green",
-        )
-    )
-    ctx.close()
 
 
 @app.command()
@@ -508,7 +479,7 @@ def keys(
 
     keys = ctx.db.list_keys(provider=provider.lower() if provider else None)
     if not keys:
-        console.print("[yellow]No keys stored.[/] Run `synckey key add <provider>` to add one.")
+        console.print("[yellow]No keys stored.[/] Run `synckey setup` to add one.")
         ctx.close()
         return
 
@@ -543,13 +514,25 @@ def keys(
 
 
 @app.command()
-def setup():
+def setup(force: bool = typer.Option(False, "--force", help="Regenerate the unified API key.")):
     """Add or update provider API keys (interactive guided setup)."""
     ensure_home()
     ctx = Context()
 
     # 1. Unified key
-    if not ctx.unified_key_hash():
+    if force:
+        unified = generate_unified_key()
+        ctx.db.set_meta("unified_key_hash", sha256(unified))
+        ctx.db.set_meta("created_at", str(time.time()))
+        _ = ctx.box
+        console.print(
+            Panel.fit(
+                f"Your new unified API key (shown once — store it now):\n\n  [bold cyan]{unified}[/]",
+                title="Unified key regenerated",
+                border_style="green",
+            )
+        )
+    elif not ctx.unified_key_hash():
         unified = generate_unified_key()
         ctx.db.set_meta("unified_key_hash", sha256(unified))
         ctx.db.set_meta("created_at", str(time.time()))
@@ -640,9 +623,8 @@ def setup():
     ctx.close()
 
 
-@app.command()
-def guide():
-    """Interactive walkthrough of synckey concepts (any time, not just first run)."""
+def _run_guide():
+    """Interactive walkthrough of synckey concepts."""
     console.print(Panel.fit(
         "[bold]synckey guide[/] let's walk through how it all works.\n"
         "Press Enter at each step, or Ctrl+C to quit anytime.",
@@ -784,19 +766,18 @@ def routing_preset(
 def serve(
     host: str = typer.Option(None, "--host", "-h"),
     port: int = typer.Option(None, "--port", "-p"),
-    workers: int = typer.Option(1, "--workers", help="Uvicorn worker count (1 for single-process async)."),
-    reload: bool = typer.Option(False, "--reload"),
 ):
-    """Run the unified OpenAI-compatible gateway."""
-    import uvicorn
-    from .server import create_app
+    """Run the unified OpenAI-compatible gateway (background)."""
+    import subprocess
+    import sys
+    import os
 
     ctx = load_ctx()
     if not ctx.unified_key_hash():
-        err_con.print("[red]Not initialized.[/] Run `synckey init` first.")
+        err_con.print("[red]Not initialized.[/] Run `synckey setup` first.")
         raise typer.Exit(1)
     if not ctx.db.providers_with_keys():
-        err_con.print("[yellow]Warning:[/] no provider keys stored yet. Add one: `synckey key add`.")
+        err_con.print("[yellow]Warning:[/] no provider keys stored yet. Run `synckey setup` to add one.")
 
     bind_host = host or ctx.settings.host
     bind_port = port or ctx.settings.port
@@ -818,30 +799,68 @@ def serve(
             f"tier fallback:    {'on' if ctx.settings.tier_fallback_enabled else 'off'}\n"
             f"deferred queue:   {'on' if ctx.settings.deferred_enabled else 'off'}"
             f" (202 + poll when all keys cooling; TTL {int(ctx.settings.deferred_ttl)}s)\n"
-            f"quality floor:    per-request via X-Quality-Floor header\n\n"
-            f"[dim]Stop:[/] Ctrl+C",
+            f"quality floor:    per-request via X-Quality-Floor header",
             border_style="green",
         )
     )
-    uvicorn.run(
-        create_app(ctx),
-        host=bind_host,
-        port=bind_port,
-        workers=workers,
-        reload=reload,
-        log_level="warning",
-        access_log=False,
-    )
+    ctx.close()
+
+    srv = os.path.join(os.path.dirname(__file__), "_serve_temp.py")
+    with open(srv, "w") as f:
+        f.write("import uvicorn\n")
+        f.write("from synckey.server import create_app\n")
+        f.write("from synckey.context import Context\n")
+        f.write(f"uvicorn.run(create_app(Context()), host='{bind_host}', port={bind_port}, log_level='warning', access_log=False)\n")
+
+    kwargs = {"cwd": os.getcwd()}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        kwargs["stdin"] = subprocess.DEVNULL
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+
+    subprocess.Popen([sys.executable, srv], **kwargs)
+    console.print("\n[green]Gateway running in background.[/] Use [bold]synckey status[/] to monitor.")
 
 
 @app.command()
 def usage(
     hours: float = typer.Option(None, "--hours"),
     recent: bool = typer.Option(False, "--recent"),
+    spend: bool = typer.Option(False, "--spend", help="Show cost breakdown by provider and model."),
 ):
-    """Token usage and request monitoring."""
+    """Token usage and request monitoring.
+
+    Use --spend for cost breakdown, --recent for last 25 requests.
+    """
     ctx = load_ctx()
     since = time.time() - hours * 3600 if hours else None
+    totals = ctx.db.usage_totals(since)
+
+    if spend:
+        total_cost = totals["cost_usd"] or 0.0
+        console.print(f"[bold]Total spend:[/] [green]{fmt_cost(total_cost)}[/]"
+                      + (f" (last {hours}h)" if hours else " (all time)"))
+        summary = ctx.db.usage_summary(since)
+        if not summary:
+            console.print("[dim]No usage data.[/]")
+            ctx.close()
+            return
+        table = Table(title="Spend breakdown")
+        for col in ("provider", "model", "tier", "requests", "tokens", "cost", "% total"):
+            table.add_column(col)
+        for r in summary:
+            cost = r["cost_usd"] or 0.0
+            pct = (cost / total_cost * 100) if total_cost else 0
+            tier_name = TIER_NAMES.get(r["tier"] or 0, "")
+            table.add_row(
+                r["provider"], r["model"], tier_name,
+                str(r["requests"]), fmt_num(r["total_tokens"]),
+                fmt_cost(cost), f"{pct:.1f}%",
+            )
+        console.print(table)
+        ctx.close()
+        return
 
     if recent:
         table = Table(title="Recent requests")
@@ -861,14 +880,13 @@ def usage(
         ctx.close()
         return
 
-    totals = ctx.db.usage_totals(since)
     console.print(
         Panel.fit(
             f"requests:  [bold]{totals['requests'] or 0}[/]  ([red]{totals['errors'] or 0} errors[/])\n"
             f"tokens:    [bold cyan]{fmt_num(totals['total_tokens'])}[/] total "
             f"({fmt_num(totals['prompt_tokens'])} prompt + {fmt_num(totals['completion_tokens'])} completion)\n"
             f"cost:      [bold green]{fmt_cost(totals['cost_usd'])}[/]",
-            title=f"Usage{f' (last {hours}h)' if hours else ' (all time)'}",
+            title=f"Usage{' (last {}h)'.format(hours) if hours else ' (all time)'}",
             border_style="cyan",
         )
     )
@@ -890,9 +908,37 @@ def usage(
     ctx.close()
 
 
-@app.command()
+@app.command("spend", hidden=True)
 def spend(hours: float = typer.Option(None, "--hours")):
-    """Cost breakdown by provider and model."""
+    """Cost breakdown by provider and model. (Use: synckey usage --spend)"""
+    ctx = load_ctx()
+    since = time.time() - hours * 3600 if hours else None
+    totals = ctx.db.usage_totals(since)
+    summary = ctx.db.usage_summary(since)
+
+    total_cost = totals["cost_usd"] or 0.0
+    console.print(f"[bold]Total spend:[/] [green]{fmt_cost(total_cost)}[/]"
+                  + (f" (last {hours}h)" if hours else " (all time)"))
+
+    if not summary:
+        console.print("[dim]No usage data.[/]")
+        ctx.close()
+        return
+
+    table = Table(title="Spend breakdown")
+    for col in ("provider", "model", "tier", "requests", "tokens", "cost", "% total"):
+        table.add_column(col)
+    for r in summary:
+        cost = r["cost_usd"] or 0.0
+        pct = (cost / total_cost * 100) if total_cost else 0
+        tier_name = TIER_NAMES.get(r["tier"] or 0, "")
+        table.add_row(
+            r["provider"], r["model"], tier_name,
+            str(r["requests"]), fmt_num(r["total_tokens"]),
+            fmt_cost(cost), f"{pct:.1f}%",
+        )
+    console.print(table)
+    ctx.close()
     ctx = load_ctx()
     since = time.time() - hours * 3600 if hours else None
     totals = ctx.db.usage_totals(since)
@@ -1035,7 +1081,7 @@ def status():
     console.print(
         Panel.fit(
             f"home:         [cyan]{home()}[/]\n"
-            f"initialized:  {'[green]yes[/]' if initialized else '[red]no, run synckey init[/]'}\n"
+            f"initialized:  {'[green]yes[/]' if initialized else '[red]no, run synckey setup[/]'}\n"
             f"providers:    {len(configured)} ({', '.join(configured) or 'none'})\n"
             f"keys:         {len(keys)} stored  [green]{n_live} live[/]  [yellow]{n_cool} cooling[/]  [red]{n_dead} dead[/]\n"
             f"models known: {len(ctx.router.index)}\n"
@@ -1099,7 +1145,7 @@ def test(
             try:
                 secret = ctx.box.open(k.secret)
             except RuntimeError:
-                table.add_row(pid, f"#{k.id} {k.label}", cur, "[red]key corrupt re-add with synckey key add[/]")
+                table.add_row(pid, f"#{k.id} {k.label}", cur, "[red]key corrupt re-add with synckey setup[/]")
                 continue
             try:
                 resp = httpx.get(
@@ -1172,7 +1218,7 @@ def _run_test_calls(ctx, provider, model, calls):
     keys = ctx.db.list_keys(provider=provider.lower(), enabled_only=True)
     if not keys:
         err_con.print(f"[red]No enabled keys for[/] {provider}.")
-        err_con.print(f"[dim]Run `synckey key add {provider}` first.[/]")
+        err_con.print(f"[dim]Run `synckey setup` first.[/]")
         return
 
     console.print(f"[cyan]Testing[/] {provider}/{model} {calls} call(s) with {len(keys)} key(s)\n")
@@ -1195,7 +1241,7 @@ def _run_test_calls(ctx, provider, model, calls):
                 secret = ctx.box.open(k.secret)
             except RuntimeError:
                 err_con.print(f"[red]Key #{k.id} is corrupt (secret.key may have changed).[/]")
-                err_con.print(f"[dim]Re-add it: synckey key add {provider}[/]")
+                err_con.print(f"[dim]Re-add it: synckey setup[/]")
                 continue
             status, latency, tokens, error, chain = asyncio.run(
                 _call_model(ctx, provider.lower(), model, k, secret)
@@ -1403,6 +1449,26 @@ def dash(interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh i
         pass
     finally:
         ctx.close()
+
+
+@app.command()
+def renew():
+    """Regenerate your unified API key (old key becomes invalid)."""
+    ensure_home()
+    ctx = Context()
+    unified = generate_unified_key()
+    ctx.db.set_meta("unified_key_hash", sha256(unified))
+    ctx.db.set_meta("created_at", str(time.time()))
+    _ = ctx.box
+    console.print(
+        Panel.fit(
+            f"Your new unified API key (old key is now invalid):\n\n  [bold cyan]{unified}[/]\n\n"
+            f"Update your clients to use the new key.",
+            title="Key regenerated",
+            border_style="green",
+        )
+    )
+    ctx.close()
 
 
 @app.command()

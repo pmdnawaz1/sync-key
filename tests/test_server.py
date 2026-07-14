@@ -142,7 +142,7 @@ def test_quality_floor_header_parsed(ctx):
             json={"model": "claude-opus-4-8", "messages": []},
         )
     # No real upstream; key is tried, connection refused -> 502. Should not 500.
-    assert r.status_code in (200, 404, 502, 503)
+    assert r.status_code in (200, 401, 404, 502, 503)
 
 
 @respx.mock

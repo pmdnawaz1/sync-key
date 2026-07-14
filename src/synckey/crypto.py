@@ -37,5 +37,5 @@ class SecretBox:
         except InvalidToken as exc:
             raise RuntimeError(
                 "Could not decrypt a stored secret. The secret.key file may have "
-                "changed. Re-add affected keys with `synckey key add`."
+                "changed. Re-add affected keys with `synckey setup`."
             ) from exc

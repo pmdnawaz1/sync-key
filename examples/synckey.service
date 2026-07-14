@@ -1,0 +1,35 @@
+[Unit]
+Description=synckey unified AI gateway
+Documentation=https://github.com/pydmd/synckey
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=synckey
+Group=synckey
+WorkingDirectory=/opt/synckey
+ExecStart=/usr/bin/python3 -m synckey serve
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=synckey
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/synckey /run/synckey
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target
