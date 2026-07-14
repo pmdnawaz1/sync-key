@@ -1,12 +1,23 @@
 [project]
 name = "synckey"
 version = "0.1.0"
-description = "Merge every AI provider key behind one unified, OpenAI-compatible API key. Round-robin, rate-limit eating, token monitoring, provider auto-detection all from the CLI."
+description = "One API key for every AI provider. Automatic failover, tier-based fallback, and zero rate-limit headaches."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "synckey" }]
-keywords = ["llm", "gateway", "openai", "groq", "gemini", "cerebras", "cohere", "nvidia", "proxy", "api-key"]
+authors = [{ name = "synckey", email = "synckey@example.com" }]
+keywords = ["llm", "gateway", "openai", "groq", "gemini", "cerebras", "cohere", "nvidia", "proxy", "api-key", "ai", "routing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
@@ -22,6 +33,13 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21"]
 
 [project.scripts]
 synckey = "synckey.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/pmdnawaz1/synckey"
+Documentation = "https://github.com/pmdnawaz1/synckey#readme"
+Repository = "https://github.com/pmdnawaz1/synckey"
+Issues = "https://github.com/pmdnawaz1/synckey/issues"
+Changelog = "https://github.com/pmdnawaz1/synckey/releases"
 
 [build-system]
 requires = ["hatchling"]

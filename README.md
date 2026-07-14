@@ -1,7 +1,7 @@
 ﻿# synckey
 
 <h1 align="center">
-  <img src="https://img.shields.io/github/stars/pydmd/synckey?style=flat&color=20MDFF" alt="Stars"/>
+  <img src="https://img.shields.io/github/stars/pmdnawaz1/synckey?style=flat&color=20MDFF" alt="Stars"/>
   <img src="https://img.shields.io/pypi/v/synckey?style=flat&color=20MDFF" alt="PyPI"/>
   <img src="https://img.shields.io/pypi/l/synckey?style=flat&color=20MDFF" alt="License"/>
   <br/>
@@ -636,7 +636,7 @@ sudo systemctl status synckey
 ```ini
 [Unit]
 Description=synckey unified AI gateway
-Documentation=https://github.com/pydmd/synckey
+Documentation=https://github.com/pmdnawaz1/synckey
 After=network-online.target
 Wants=network-online.target
 

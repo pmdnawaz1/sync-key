@@ -1,6 +1,6 @@
 [Unit]
 Description=synckey unified AI gateway
-Documentation=https://github.com/pydmd/synckey
+Documentation=https://github.com/pmdnawaz1/synckey
 After=network-online.target
 Wants=network-online.target
 
